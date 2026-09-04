@@ -48,14 +48,38 @@ def _spans(page):
 
 
 def _find_separator_line(doc):
-    """Devuelve (page_num, y, x0, x1, text) de la PRIMERA línea de guiones
-    (la que separa el header de columnas de los datos del BOM)."""
+    """Devuelve (page_num, y, x0, x1, text) de la línea de guiones que separa el
+    header de columnas de los datos del BOM.
+
+    Oracle emite VARIOS renglones de guiones seguidos: el principal (con todas las
+    columnas de la tabla) y continuaciones cortas de las últimas columnas
+    ('Item Category / Rev Description'). Según el ancho del reporte, el principal
+    no siempre es el primero, así que se elige el renglón con MÁS grupos de
+    guiones, que es el que describe la tabla completa.
+    """
+    mejor = None          # (n_grupos, page_num, y, x0, x1, texto)
     for pn in range(len(doc)):
+        por_y = {}
         for s in _spans(doc[pn]):
-            t = s["text"]
-            if t.count("-") >= 9 and SEPARATOR_RE.search(t):
-                return pn, s["bbox"][1], s["bbox"][0], s["bbox"][2], t
-    return None, None, None, None, None
+            por_y.setdefault(round(s["bbox"][1], 1), []).append(s)
+
+        for y in sorted(por_y):
+            spans_y = sorted(por_y[y], key=lambda s: s["bbox"][0])
+            texto = "".join(s["text"] for s in spans_y)
+            if texto.count("-") < 9 or not SEPARATOR_RE.search(texto):
+                continue
+            n_grupos = len(GROUP_RE.findall(texto))
+            x0 = min(s["bbox"][0] for s in spans_y)
+            x1 = max(s["bbox"][2] for s in spans_y)
+            if mejor is None or n_grupos > mejor[0]:
+                mejor = (n_grupos, pn, y, x0, x1, texto)
+        if mejor is not None:
+            break          # basta con la primera página que tenga la tabla
+
+    if mejor is None:
+        return None, None, None, None, None
+    _, pn, y, x0, x1, texto = mejor
+    return pn, y, x0, x1, texto
 
 
 def _find_header_text(doc, sep_page, sep_y):
