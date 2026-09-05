@@ -211,9 +211,19 @@ def update_revision(doc, layout, font_path=None, font_obj=None,
     revision_misma_linea: si el valor de la revisión quedó en la línea de abajo
     (wrap), reescribe el cambio junto a la etiqueta 'Revision:', en su misma línea.
     """
-    sp, ep = layout["sep_page"], layout["eor_page"]
+    # La revisión aparece en el bloque de parámetros y en el encabezado de cada
+    # página. Ese bloque puede estar en páginas ANTERIORES a la tabla (p. ej. en
+    # los reportes horizontales la tabla arranca en la pág. 2), así que se recorre
+    # desde la primera página hasta el fin de la sección del BOM.
+    ep = layout["eor_page"]
+    sp = 0
 
-    first = _find_revision_values(doc[sp])
+    first = None
+    for pn in range(sp, ep + 1):
+        vals = _find_revision_values(doc[pn])
+        if vals:
+            first = vals
+            break
     if not first:
         return False, "No se encontró 'Revision:' en el BOM.", None, None
     old_rev = first[0]["text"].strip()
