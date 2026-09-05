@@ -24,11 +24,13 @@ function EnfocarVentana($titulo1, $titulo2) {
 for ($i = 1; $i -le 50; $i++) {
     Start-Sleep -Milliseconds 500
 
-    # 1) Abrir consola y desbloquear el pegado
+    # 1) Abrir consola y desbloquear el pegado (vía clipboard, no tecleado directo)
     [System.Windows.Forms.SendKeys]::SendWait("^+j")
-    Start-Sleep -Milliseconds 900
+    Start-Sleep -Milliseconds 1200
 
-    [System.Windows.Forms.SendKeys]::SendWait("allow pasting")
+    Set-Clipboard -Value "allow pasting"
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
     Start-Sleep -Milliseconds 300
     [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
     Start-Sleep -Milliseconds 500
