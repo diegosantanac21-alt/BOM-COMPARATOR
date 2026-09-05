@@ -1,0 +1,83 @@
+Add-Type -AssemblyName System.Windows.Forms
+$shell = New-Object -ComObject WScript.Shell
+
+$carpeta = "C:\PDFs"
+if (!(Test-Path $carpeta)) { New-Item -ItemType Directory -Path $carpeta | Out-Null }
+
+$jsCode = 'copy((document.body.innerText.match(/item:\s*(.+)/)||["","sin_nombre"])[1].trim())'
+
+$shell.AppActivate("Edge") | Out-Null
+Start-Sleep -Milliseconds 500
+
+function EnfocarVentana($titulo1, $titulo2) {
+    $intentos = 0
+    $ok = $false
+    while ($intentos -lt 10 -and -not $ok) {
+        Start-Sleep -Milliseconds 400
+        $ok = $shell.AppActivate($titulo1)
+        if (-not $ok -and $titulo2) { $ok = $shell.AppActivate($titulo2) }
+        $intentos++
+    }
+    return $ok
+}
+
+for ($i = 1; $i -le 50; $i++) {
+    Start-Sleep -Milliseconds 500
+
+    # 1) Abrir consola y desbloquear el pegado
+    [System.Windows.Forms.SendKeys]::SendWait("^+j")
+    Start-Sleep -Milliseconds 900
+
+    [System.Windows.Forms.SendKeys]::SendWait("allow pasting")
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 500
+
+    # 2) Pegar y ejecutar el código que extrae el texto después de "item: "
+    Set-Clipboard -Value $jsCode
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 600
+
+    $nombre = Get-Clipboard
+    if ([string]::IsNullOrWhiteSpace($nombre)) { $nombre = "sin_nombre_$i" }
+    $nombre = $nombre -replace '[\\/:*?"<>|]', '_'
+
+    [System.Windows.Forms.SendKeys]::SendWait("{F12}")
+    Start-Sleep -Milliseconds 600
+
+    # 3) Abrir diálogo de impresión
+    [System.Windows.Forms.SendKeys]::SendWait("^p")
+    Start-Sleep -Milliseconds 1200
+    [System.Windows.Forms.SendKeys]::SendWait("%s")
+
+    # 4) Esperar y forzar el foco sobre "Guardar como"
+    $enfocado = EnfocarVentana "Guardar como" "Save As"
+    Start-Sleep -Milliseconds 400
+
+    if (-not $enfocado) {
+        Write-Host "AVISO: no se pudo enfocar 'Guardar como' en la iteracion $i - revisa el titulo exacto de esa ventana"
+    }
+
+    # 5) Escribir ruta y nombre del archivo
+    Set-Clipboard -Value "$carpeta\$nombre.pdf"
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("^a")
+    Start-Sleep -Milliseconds 200
+    [System.Windows.Forms.SendKeys]::SendWait("^v")
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 700
+    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
+    Start-Sleep -Milliseconds 500
+
+    # 6) Ir a la siguiente pestaña
+    $shell.AppActivate("Edge") | Out-Null
+    Start-Sleep -Milliseconds 300
+    [System.Windows.Forms.SendKeys]::SendWait("^{TAB}")
+    Start-Sleep -Milliseconds 800
+}
+
+Write-Host "Listo, revisa $carpeta"
