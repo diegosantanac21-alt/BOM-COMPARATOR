@@ -2,36 +2,40 @@
 #  Imprime a PDF las pestañas de Edge que contienen BOMs, nombrando cada
 #  archivo con el código del item extraído de la propia página.
 #
-#  Cambios respecto a la versión anterior:
-#   - Regex corregido: flag /i (el texto dice "Item:" con mayúscula) y \S+
-#     para tomar solo el código, no toda la línea con la descripción.
-#   - Se limpia el portapapeles antes de cada extracción, para no heredar
-#     un valor viejo cuando copy() falla.
-#   - Se muestra en pantalla lo que capturó cada iteración (antes fallaba
-#     en silencio).
-#   - "allow pasting" se hace UNA sola vez, fuera del bucle.
-#   - DevTools se cierra con la misma combinación con que se abre.
+#  Correcciones de esta versión:
+#   - Alt+N para enfocar el campo "Nombre de archivo" del diálogo Guardar como
+#     (antes el Ctrl+A no llegaba al campo y se guardaba con el nombre sugerido).
+#   - {DEL} explícito para borrar el nombre previo.
+#   - DevTools se cierra ANTES de abrir el diálogo de impresión.
+#   - Se VERIFICA que el archivo se haya creado; si no, avisa.
+#   - Sin el segundo ENTER "a ciegas": el de reemplazo solo se manda si hace falta.
+#   - Esperas más holgadas en los puntos donde el diálogo tarda en responder.
 # ============================================================================
 
 Add-Type -AssemblyName System.Windows.Forms
 $shell = New-Object -ComObject WScript.Shell
 
-$carpeta = "C:\PDFs"
+# ── CONFIGURACIÓN ───────────────────────────────────────────────────────────
+$carpeta       = "C:\PDFs"
+$totalPestanas = 50
+$factorEspera  = 1.0     # súbelo a 1.5 o 2 si tu equipo va lento
+# ────────────────────────────────────────────────────────────────────────────
+
 if (!(Test-Path $carpeta)) { New-Item -ItemType Directory -Path $carpeta | Out-Null }
 
-# Cuántas pestañas procesar
-$totalPestanas = 50
+function Esperar($ms) { Start-Sleep -Milliseconds ([int]($ms * $factorEspera)) }
+function Tecla($k)     { [System.Windows.Forms.SendKeys]::SendWait($k) }
 
 # Extrae SOLO el código del item (p. ej. 4D-81-584Z-G)
-#   /i    -> ignora mayúsculas: la página dice "Item:", no "item:"
-#   \S+   -> se detiene en el primer espacio (sin la descripción)
+#   /i  -> la página dice "Item:" con mayúscula
+#   \S+ -> se detiene en el primer espacio (excluye la descripción)
 $jsCode = 'copy((document.body.innerText.match(/item:\s*(\S+)/i)||["","sin_nombre"])[1].trim())'
 
 function EnfocarVentana($titulo1, $titulo2) {
     $intentos = 0
     $ok = $false
-    while ($intentos -lt 10 -and -not $ok) {
-        Start-Sleep -Milliseconds 400
+    while ($intentos -lt 12 -and -not $ok) {
+        Esperar 400
         $ok = $shell.AppActivate($titulo1)
         if (-not $ok -and $titulo2) { $ok = $shell.AppActivate($titulo2) }
         $intentos++
@@ -40,63 +44,64 @@ function EnfocarVentana($titulo1, $titulo2) {
 }
 
 $shell.AppActivate("Edge") | Out-Null
-Start-Sleep -Milliseconds 500
+Esperar 600
 
 # ── Desbloquear el pegado en la consola: UNA sola vez ───────────────────────
-[System.Windows.Forms.SendKeys]::SendWait("^+j")
-Start-Sleep -Milliseconds 1500
+Tecla "^+j"
+Esperar 1500
 Set-Clipboard -Value "allow pasting"
-Start-Sleep -Milliseconds 300
-[System.Windows.Forms.SendKeys]::SendWait("^v")
-Start-Sleep -Milliseconds 300
-[System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-Start-Sleep -Milliseconds 500
-[System.Windows.Forms.SendKeys]::SendWait("^+j")   # cerrar DevTools
-Start-Sleep -Milliseconds 600
+Esperar 300
+Tecla "^v"
+Esperar 300
+Tecla "{ENTER}"
+Esperar 500
+Tecla "^+j"          # cerrar DevTools
+Esperar 700
 
-$okCount = 0
-$falloCount = 0
+$okNombre = 0; $falloNombre = 0; $okArchivo = 0; $falloArchivo = 0
 
 for ($i = 1; $i -le $totalPestanas; $i++) {
-    Start-Sleep -Milliseconds 500
 
-    # ── 1) Abrir consola ────────────────────────────────────────────────────
-    [System.Windows.Forms.SendKeys]::SendWait("^+j")
-    Start-Sleep -Milliseconds 1200
+    Write-Host ""
+    Write-Host "--- Pestaña $i de $totalPestanas ---" -ForegroundColor Cyan
 
-    # ── 2) Limpiar portapapeles para no heredar el valor anterior ───────────
-    Set-Clipboard -Value ""
-    Start-Sleep -Milliseconds 200
+    # ── 1) Extraer el nombre desde la consola ───────────────────────────────
+    $shell.AppActivate("Edge") | Out-Null
+    Esperar 400
+    Tecla "^+j"
+    Esperar 1400
 
-    # ── 3) Pegar y ejecutar el JS que extrae el código del item ─────────────
+    Set-Clipboard -Value ""          # limpiar: no heredar el valor anterior
+    Esperar 250
+
     Set-Clipboard -Value $jsCode
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    Start-Sleep -Milliseconds 800
+    Esperar 300
+    Tecla "^v"
+    Esperar 400
+    Tecla "{ENTER}"
+    Esperar 900
 
     $nombre = Get-Clipboard
 
-    # Cerrar DevTools con la misma combinación con que se abrió
-    [System.Windows.Forms.SendKeys]::SendWait("^+j")
-    Start-Sleep -Milliseconds 600
+    Tecla "^+j"                      # cerrar DevTools ANTES de imprimir
+    Esperar 800
 
-    # ── 4) Validar lo capturado ─────────────────────────────────────────────
-    if ([string]::IsNullOrWhiteSpace($nombre) -or $nombre -eq $jsCode -or $nombre -eq "sin_nombre") {
-        Write-Host "[$i] NO se pudo extraer el nombre -> se usa 'sin_nombre_$i'" -ForegroundColor Yellow
+    # ── 2) Validar el nombre capturado ──────────────────────────────────────
+    if ([string]::IsNullOrWhiteSpace($nombre) -or
+        $nombre -eq $jsCode -or
+        $nombre -eq "sin_nombre" -or
+        $nombre.Length -gt 100) {
+        Write-Host "  Nombre: NO extraido -> 'sin_nombre_$i'" -ForegroundColor Yellow
         $nombre = "sin_nombre_$i"
-        $falloCount++
+        $falloNombre++
     } else {
-        Write-Host "[$i] Capturado: '$nombre'" -ForegroundColor Green
-        $okCount++
+        Write-Host "  Nombre: '$nombre'" -ForegroundColor Green
+        $okNombre++
     }
 
-    # Quitar caracteres no válidos para nombre de archivo
-    $nombre = $nombre -replace '[\\/:*?"<>|]', '_'
-    $nombre = $nombre.Trim()
+    $nombre = ($nombre -replace '[\\/:*?"<>|]', '_').Trim()
 
-    # Evitar sobrescribir si el nombre ya existe
+    # No sobrescribir si ya existe
     $destino = Join-Path $carpeta "$nombre.pdf"
     $n = 2
     while (Test-Path $destino) {
@@ -104,38 +109,65 @@ for ($i = 1; $i -le $totalPestanas; $i++) {
         $n++
     }
 
-    # ── 5) Diálogo de impresión -> Guardar como PDF ─────────────────────────
-    [System.Windows.Forms.SendKeys]::SendWait("^p")
-    Start-Sleep -Milliseconds 1500
-    [System.Windows.Forms.SendKeys]::SendWait("%s")
+    # ── 3) Diálogo de impresión ─────────────────────────────────────────────
+    Tecla "^p"
+    Esperar 2000                     # la vista previa tarda
 
+    Tecla "%s"                       # Alt+S = Guardar / Save
+    Esperar 500
+
+    # ── 4) Enfocar el diálogo "Guardar como" ────────────────────────────────
     $enfocado = EnfocarVentana "Guardar como" "Save As"
-    Start-Sleep -Milliseconds 500
     if (-not $enfocado) {
-        Write-Host "    AVISO: no se pudo enfocar 'Guardar como' en la iteracion $i" -ForegroundColor Red
+        Write-Host "  AVISO: no se enfoco 'Guardar como'" -ForegroundColor Red
+    }
+    Esperar 1000                     # el diálogo tarda en aceptar teclas
+
+    # ── 5) Reemplazar el nombre sugerido ────────────────────────────────────
+    Tecla "%n"                       # Alt+N -> campo "Nombre de archivo"
+    Esperar 400
+    Tecla "^a"                       # seleccionar todo
+    Esperar 300
+    Tecla "{DEL}"                    # borrar explícitamente
+    Esperar 300
+
+    Set-Clipboard -Value $destino
+    Esperar 400
+    Tecla "^v"                       # pegar la ruta completa
+    Esperar 500
+    Tecla "{ENTER}"
+    Esperar 1200
+
+    # ── 6) Verificar que el archivo se creó ─────────────────────────────────
+    $creado = $false
+    for ($t = 0; $t -lt 10; $t++) {
+        if (Test-Path $destino) { $creado = $true; break }
+        Esperar 400
     }
 
-    # ── 6) Escribir la ruta completa y confirmar ────────────────────────────
-    Set-Clipboard -Value $destino
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("^a")
-    Start-Sleep -Milliseconds 200
-    [System.Windows.Forms.SendKeys]::SendWait("^v")
-    Start-Sleep -Milliseconds 300
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")
-    Start-Sleep -Milliseconds 900
-    [System.Windows.Forms.SendKeys]::SendWait("{ENTER}")   # por si pregunta "reemplazar"
-    Start-Sleep -Milliseconds 600
+    if ($creado) {
+        Write-Host "  Guardado OK" -ForegroundColor Green
+        $okArchivo++
+    } else {
+        Write-Host "  NO se encontro el archivo: $destino" -ForegroundColor Red
+        $falloArchivo++
+        # Puede haber quedado un diálogo abierto (p. ej. confirmar reemplazo)
+        Tecla "{ENTER}"
+        Esperar 800
+    }
 
     # ── 7) Siguiente pestaña ────────────────────────────────────────────────
     $shell.AppActivate("Edge") | Out-Null
-    Start-Sleep -Milliseconds 400
-    [System.Windows.Forms.SendKeys]::SendWait("^{TAB}")
-    Start-Sleep -Milliseconds 900
+    Esperar 600
+    Tecla "^{TAB}"
+    Esperar 1000
 }
 
 Write-Host ""
 Write-Host "===========================================" -ForegroundColor Cyan
-Write-Host "Terminado. Nombres extraidos OK : $okCount"
-Write-Host "           Sin nombre           : $falloCount"
-Write-Host "Revisa: $carpeta" -ForegroundColor Cyan
+Write-Host " Nombres extraidos OK : $okNombre"
+Write-Host " Nombres fallidos     : $falloNombre"
+Write-Host " Archivos guardados   : $okArchivo"
+Write-Host " Archivos no creados  : $falloArchivo"
+Write-Host " Carpeta: $carpeta" -ForegroundColor Cyan
+Write-Host "==========================================="
