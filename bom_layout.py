@@ -73,8 +73,10 @@ def _find_separator_line(doc):
             x1 = max(s["bbox"][2] for s in spans_y)
             if mejor is None or n_grupos > mejor[0]:
                 mejor = (n_grupos, pn, y, x0, x1, texto)
-        if mejor is not None:
-            break          # basta con la primera página que tenga la tabla
+        # Si ya se halló un separador con pinta de tabla completa, no hace falta
+        # seguir: los reportes posteriores (p. ej. Routing) traen los suyos.
+        if mejor is not None and mejor[0] >= 6:
+            break
 
     if mejor is None:
         return None, None, None, None, None
