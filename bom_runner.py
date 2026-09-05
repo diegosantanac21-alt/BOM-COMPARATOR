@@ -19,7 +19,7 @@ import fitz
 
 from bom_layout import detect_layout, validate_layout
 from bom_engine import (update_revision, add_bom_at_start, replace_part,
-                        insert_at_end, edit_field, to_landscape)
+                        insert_at_end, edit_field, to_landscape, _fmt_rev_num)
 from bom_excel import read_instructions
 
 
@@ -38,73 +38,110 @@ def _match_instructions(stem, instr):
     return None, None
 
 
-def _output_name(stem, codigo_bom, item_bom):
-    """Nombre de salida: entrada + '__' + item del BOM (solo si el código no
-    estaba ya en el nombre). Si no se agregó BOM, sufijo '__redline'."""
-    if item_bom and (not codigo_bom or codigo_bom.lower() not in stem.lower()):
-        return f"{stem}__{item_bom}_.pdf"
-    return f"{stem}__redline.pdf"
+def _output_name(stem, codigo_bom, item_bom, rev_bom=None):
+    """Nombre de salida con el formato:  item(BOM)_REVxxx.pdf
+    p. ej.  4D-81-584Z-G(BOM-005379)_REV001.pdf
+
+    - `stem` es el item (el nombre del PDF de entrada).
+    - El código del BOM va entre paréntesis; si el nombre ya lo contiene, no se
+      repite.
+    - `rev_bom` es la revisión numérica del BOM (3 dígitos). Si no se indicó,
+      se usa 001.
+    """
+    rev = _fmt_rev_num(rev_bom) if rev_bom else "001"
+
+    if codigo_bom and codigo_bom.lower() not in stem.lower():
+        return f"{stem}({codigo_bom})_REV{rev}.pdf"
+    return f"{stem}_REV{rev}.pdf"
 
 
-def process_one(pdf_path, paquete, output_folder):
+def process_one(pdf_path, paquete, output_folder, generar_limpio=True):
     """Procesa UN PDF con su paquete de instrucciones. Devuelve dict de resultado."""
     stem = os.path.splitext(os.path.basename(pdf_path))[0]
     log = []
     cfg = paquete["config"]
 
-    doc = fitz.open(pdf_path)
-    layout = detect_layout(doc)
-    ok, msg = validate_layout(doc, layout)
+    # Se procesan DOS documentos en paralelo con las mismas operaciones:
+    #   doc_r -> versión REDLINE (cambios marcados: tachado + rojo)
+    #   doc_c -> versión LIMPIA  (cambios ya aplicados, en negro)
+    doc_r = fitz.open(pdf_path)
+    doc_c = fitz.open(pdf_path) if generar_limpio else None
+
+    layout = detect_layout(doc_r)
+    ok, msg = validate_layout(doc_r, layout)
     if not ok:
+        doc_r.close()
+        if doc_c: doc_c.close()
         return {"archivo": stem, "estado": "ERROR", "detalle": msg, "log": []}
     log.append(f"layout: {msg}")
 
     new_rev, item_bom = None, None
 
+    def en_ambos(fn, *args, **kw):
+        """Aplica la operación al redline y, si corresponde, al limpio.
+        Devuelve el resultado del redline y re-detecta el layout."""
+        nonlocal layout
+        r = fn(doc_r, layout, *args, redline=True, **kw)
+        if doc_c is not None:
+            lay_c = detect_layout(doc_c)
+            fn(doc_c, lay_c, *args, redline=False, **kw)
+        layout = detect_layout(doc_r)
+        return r
+
     # 1) Revisión
     if cfg.get("actualizar_revision", True):
-        ok, m, _old, new_rev = update_revision(
-            doc, layout, revision_misma_linea=cfg.get("revision_misma_linea", False))
-        log.append(m); layout = detect_layout(doc)
+        ok, m, _old, new_rev = en_ambos(
+            update_revision,
+            revision_misma_linea=cfg.get("revision_misma_linea", False))
+        log.append(m)
 
     # 2) Agregar BOM al inicio (condicional)
     if cfg.get("agregar_bom", True) and cfg.get("codigo_bom"):
-        ok, m, item_bom = add_bom_at_start(
-            doc, layout, cfg["codigo_bom"], new_rev or "A",
+        ok, m, item_bom = en_ambos(
+            add_bom_at_start, cfg["codigo_bom"], new_rev or "A",
             rev_bom=cfg.get("rev_bom"))
-        log.append(m); layout = detect_layout(doc)
+        log.append(m)
 
     # 3) Reemplazos de componente
     for old, new in paquete["reemplazos"]:
-        ok, m = replace_part(doc, layout, old, new)
-        log.append(m); layout = detect_layout(doc)
+        ok, m = en_ambos(replace_part, old, new)
+        log.append(m)
 
     # 4) Ediciones de campo
     for item, campo, valor in paquete["ediciones"]:
-        ok, m = edit_field(doc, layout, item, campo, valor)
-        log.append(m); layout = detect_layout(doc)
+        ok, m = en_ambos(edit_field, item, campo, valor)
+        log.append(m)
 
     # 5) Inserciones al final
     for comp in paquete["inserciones"]:
-        ok, m = insert_at_end(doc, layout, comp)
-        log.append(m); layout = detect_layout(doc)
+        ok, m = en_ambos(insert_at_end, comp)
+        log.append(m)
 
     # Post-proceso opcional: página horizontal (apaisada)
     if cfg.get("pagina_horizontal", False):
-        land = to_landscape(doc)
-        doc.close()
-        doc = land
+        land_r = to_landscape(doc_r); doc_r.close(); doc_r = land_r
+        if doc_c is not None:
+            land_c = to_landscape(doc_c); doc_c.close(); doc_c = land_c
         log.append("Páginas convertidas a horizontal (apaisado).")
 
     os.makedirs(output_folder, exist_ok=True)
-    out_name = _output_name(stem, cfg.get("codigo_bom"), item_bom)
-    out_path = os.path.join(output_folder, out_name)
-    doc.save(out_path)
-    doc.close()
-    return {"archivo": stem, "estado": "OK", "salida": out_name, "log": log}
+    out_name = _output_name(stem, cfg.get("codigo_bom"), item_bom,
+                            cfg.get("rev_bom"))
+    doc_r.save(os.path.join(output_folder, out_name))
+    doc_r.close()
+
+    salida_limpia = None
+    if doc_c is not None:
+        salida_limpia = out_name.replace(".pdf", "_LIMPIO.pdf")
+        doc_c.save(os.path.join(output_folder, salida_limpia))
+        doc_c.close()
+        log.append(f"Versión limpia: {salida_limpia}")
+
+    return {"archivo": stem, "estado": "OK", "salida": out_name,
+            "salida_limpia": salida_limpia, "log": log}
 
 
-def run_batch(input_folder, xlsx_path, output_folder):
+def run_batch(input_folder, xlsx_path, output_folder, generar_limpio=True):
     """Procesa todos los PDFs de input_folder según xlsx_path. Devuelve resumen."""
     instr = read_instructions(xlsx_path)
     pdfs = sorted(glob.glob(os.path.join(input_folder, "*.pdf"))
@@ -121,7 +158,7 @@ def run_batch(input_folder, xlsx_path, output_folder):
             print(f"[—] {stem}: sin instrucciones en el Excel (saltado)")
             continue
         try:
-            r = process_one(pdf, paquete, output_folder)
+            r = process_one(pdf, paquete, output_folder, generar_limpio)
         except Exception as e:
             r = {"archivo": stem, "estado": "ERROR", "detalle": repr(e), "log": []}
         resultados.append(r)

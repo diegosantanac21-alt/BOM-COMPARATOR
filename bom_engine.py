@@ -14,6 +14,7 @@ import tempfile
 import fitz
 
 RED   = (0.85, 0.0, 0.0)
+BLACK = (0.0, 0.0, 0.0)
 WHITE = (1.0, 1.0, 1.0)
 
 
@@ -103,7 +104,8 @@ def find_in_bom_section(doc, layout, target):
 # OPERACIÓN: REEMPLAZAR CÓDIGO DE COMPONENTE (redline)
 # ════════════════════════════════════════════════════════════════════════════
 
-def replace_part(doc, layout, old_part, new_part, font_path=None, font_obj=None):
+def replace_part(doc, layout, old_part, new_part, font_path=None, font_obj=None,
+                 redline=True):
     """Por cada ocurrencia de old_part en la sección del BOM:
         - tacha old_part en rojo (en su lugar)
         - escribe new_part en rojo, subrayado, justo debajo, en la columna 'item'
@@ -118,14 +120,20 @@ def replace_part(doc, layout, old_part, new_part, font_path=None, font_obj=None)
 
     for pn, x0, y0, x1, y1 in occ:
         page = doc[pn]
-        # 1. borrar y tachar el viejo en su lugar
+        # Borrar el código viejo de su posición
         page.add_redact_annot(fitz.Rect(x0 - 1, y0 - 1, x1 + 1, y1 + 1), fill=WHITE)
         page.apply_redactions()
+
+        if not redline:
+            # MODO LIMPIO: el nuevo código ocupa el lugar del viejo, en negro
+            _write(page, x0, y0 + sz * 0.85, new_part, sz, BLACK, font_path, font_obj)
+            continue
+
+        # MODO REDLINE: viejo tachado en su lugar + nuevo debajo, subrayado
         _write(page, x0, y0 + sz * 0.85, old_part, sz, RED, font_path, font_obj)
         y_mid = y0 + (y1 - y0) * 0.48
         page.draw_line(fitz.Point(x0 - 1, y_mid), fitz.Point(x1 + 1, y_mid),
                        color=RED, width=0.7)
-        # 2. escribir el nuevo debajo, en la columna item, subrayado
         y_below = y0 + lh
         _write(page, item_x, y_below + sz * 0.85, new_part, sz, RED, font_path, font_obj)
         w = _text_width(new_part, sz, font_obj)
@@ -204,7 +212,7 @@ def _find_revision_label(page, val):
 
 
 def update_revision(doc, layout, font_path=None, font_obj=None,
-                    revision_misma_linea=False):
+                    revision_misma_linea=False, redline=True):
     """Detecta la revisión actual, calcula la siguiente y la actualiza en todas
     las páginas de la sección del BOM. Devuelve (ok, msg, old_rev, new_rev).
 
@@ -250,6 +258,13 @@ def update_revision(doc, layout, font_path=None, font_obj=None,
             # borrar el valor viejo de su posición original
             page.add_redact_annot(fitz.Rect(x0 - 1, y0 - 1, x1 + 1, y1 + 1), fill=WHITE)
             page.apply_redactions()
+
+            if not redline:
+                # MODO LIMPIO: solo la revisión nueva, en negro y en su sitio
+                _write(page, destino_x, destino_y + sz * 0.85, new_rev, sz,
+                       BLACK, font_path, font_obj)
+                n += 1
+                continue
 
             # viejo tachado (en el destino) + nuevo al lado
             _write(page, destino_x, destino_y + sz * 0.85, old_rev, sz, RED, font_path, font_obj)
@@ -416,7 +431,7 @@ def find_bom_row(doc, layout, bom_code):
 
 
 def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=None,
-                     rev_bom=None, actualizar_rev_bom=True):
+                     rev_bom=None, actualizar_rev_bom=True, redline=True):
     """Agrega el BOM al inicio, o actualiza su Rev si ya estaba.
 
     - Si el BOM NO está en la lista -> inserta la fila. Su columna `Rev` toma
@@ -458,9 +473,16 @@ def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=No
                 return (False, f"'{bom_code}': Rev actual '{rev_actual}' no es numérica; "
                                f"indica la revisión en el Excel.", None)
 
-        # redline: tachar el viejo y escribir el nuevo debajo
         page.add_redact_annot(fitz.Rect(vx0 - 1, vy0 - 1, vx1 + 1, vy1 + 1), fill=WHITE)
         page.apply_redactions()
+
+        if not redline:
+            # MODO LIMPIO: la revisión nueva ocupa el lugar de la vieja, en negro
+            _write(page, vx0, vy0 + sz * 0.85, rev_nueva, sz, BLACK, font_path, font_obj)
+            return (True, f"'{bom_code}' ya estaba: Rev '{rev_actual}' → '{rev_nueva}' "
+                          f"(pág. {pn+1}).", None)
+
+        # redline: tachar el viejo y escribir el nuevo debajo
         _write(page, vx0, vy0 + sz * 0.85, rev_actual, sz, RED, font_path, font_obj)
         y_mid = vy0 + (vy1 - vy0) * 0.5
         page.draw_line(fitz.Point(vx0, y_mid),
@@ -499,7 +521,8 @@ def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=No
                 f"(falta reflujo de página). Abortado para no perder datos.", item)
 
     page = _insert_blank_rows(doc, pn, y_first, shift)
-    write_component_fields(page, y_first, comp, layout, RED, font_path, font_obj)
+    color = RED if redline else BLACK
+    write_component_fields(page, y_first, comp, layout, color, font_path, font_obj)
     return True, f"BOM '{item}' insertado al inicio (pág. {pn+1}).", item
 
 
@@ -507,7 +530,7 @@ def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=No
 # OPERACIÓN: INSERTAR COMPONENTE AL FINAL (antes de End of Report)
 # ════════════════════════════════════════════════════════════════════════════
 
-def insert_at_end(doc, layout, comp, font_path=None, font_obj=None):
+def insert_at_end(doc, layout, comp, font_path=None, font_obj=None, redline=True):
     """Inserta un componente nuevo como última fila, justo antes de 'End of Report'."""
     ep, eor_y = layout["eor_page"], layout["eor_y"]
     if eor_y is None:
@@ -528,7 +551,8 @@ def insert_at_end(doc, layout, comp, font_path=None, font_obj=None):
                        f"(falta reflujo de página). Abortado.")
 
     page = _insert_blank_rows(doc, ep, y_insert, shift)
-    write_component_fields(page, y_insert, comp, layout, RED, font_path, font_obj)
+    color = RED if redline else BLACK
+    write_component_fields(page, y_insert, comp, layout, color, font_path, font_obj)
     return True, f"Componente '{comp.get('item','')}' insertado al final (pág. {ep+1})."
 
 
@@ -565,7 +589,8 @@ def _field_x_range(layout, field):
     return None, None
 
 
-def edit_field(doc, layout, item, field, new_value, font_path=None, font_obj=None):
+def edit_field(doc, layout, item, field, new_value, font_path=None, font_obj=None,
+               redline=True):
     """Edita un campo de un componente existente: tacha el valor viejo (rojo) y
     escribe el nuevo (rojo) en la misma columna. `field` admite alias en español."""
     key = FIELD_ALIASES.get(str(field).strip().lower())
@@ -612,6 +637,18 @@ def edit_field(doc, layout, item, field, new_value, font_path=None, font_obj=Non
     #    margen mayor borraría texto de la fila vecina.
     page.add_redact_annot(fitz.Rect(vx0 - 0.5, vy0 + 0.3, vx1 + 0.5, vy1 - 0.3), fill=WHITE)
     page.apply_redactions()
+
+    if not redline:
+        # MODO LIMPIO: el valor nuevo ocupa el lugar del viejo, en negro
+        new_value = str(new_value)
+        if key == "qty":
+            right = layout["col_x"]["qty"] + layout["col_w"].get("qty", 9) * layout["char_w"]
+            nx = right - _text_width(new_value, sz)
+        else:
+            nx = vx0
+        _write(page, nx, vy0 + sz * 0.85, new_value, sz, BLACK, font_path, font_obj)
+        return True, f"'{item}': {field} '{old_value}' → '{new_value}' (pág. {pn+1})."
+
     _write(page, vx0, vy0 + sz * 0.85, old_value, sz, RED, font_path, font_obj)
     y_mid = vy0 + (vy1 - vy0) * 0.5
     page.draw_line(fitz.Point(vx0, y_mid), fitz.Point(vx0 + _text_width(old_value, sz), y_mid),
