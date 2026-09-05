@@ -1,0 +1,1 @@
+& "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" --headless --disable-gpu --print-to-pdf="C:\PDFs\prueba.pdf" "PEGA_AQUI_LA_URL"
