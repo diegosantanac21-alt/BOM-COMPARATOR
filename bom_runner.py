@@ -51,8 +51,8 @@ def _output_name(stem, codigo_bom, item_bom, rev_bom=None):
     rev = _fmt_rev_num(rev_bom) if rev_bom else "001"
 
     if codigo_bom and codigo_bom.lower() not in stem.lower():
-        return f"{stem}({codigo_bom})_REV{rev}.pdf"
-    return f"{stem}_REV{rev}.pdf"
+        return f"{stem}({codigo_bom})_REV{rev}_REDLINE.pdf"
+    return f"{stem}_REV{rev}_REDLINE.pdf"
 
 
 def process_one(pdf_path, paquete, output_folder, generar_limpio=True):
@@ -132,10 +132,10 @@ def process_one(pdf_path, paquete, output_folder, generar_limpio=True):
 
     salida_limpia = None
     if doc_c is not None:
-        salida_limpia = out_name.replace(".pdf", "_LIMPIO.pdf")
+        salida_limpia = out_name.replace("_REDLINE.pdf", "_CLEAN_COPY.pdf")
         doc_c.save(os.path.join(output_folder, salida_limpia))
         doc_c.close()
-        log.append(f"Versión limpia: {salida_limpia}")
+        log.append(f"Clean copy: {salida_limpia}")
 
     return {"archivo": stem, "estado": "OK", "salida": out_name,
             "salida_limpia": salida_limpia, "log": log}
