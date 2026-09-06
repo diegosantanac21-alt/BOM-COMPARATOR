@@ -1,0 +1,79 @@
+"""
+Agrupa archivos en carpetas segun el codigo que aparece en su nombre.
+
+Como usarlo:
+ 1. Pon tus codigos en la lista CODIGOS.
+ 2. Pon la ruta de la carpeta donde estan los archivos en CARPETA.
+ 3. Deja PRUEBA = True para ver que haria, sin mover nada.
+ 4. Si el resultado se ve bien, cambia PRUEBA = False y vuelve a correrlo.
+
+Correr:  python agrupar_archivos.py
+"""
+
+from pathlib import Path
+import shutil
+
+# ---------------- CONFIGURACION ----------------
+
+CARPETA = r"C:\Users\tu_usuario\Downloads\mis_archivos"   # carpeta con los archivos
+
+CODIGOS = [
+    "ABC123",
+    "DEF456",
+    "GHI789",
+]
+
+PRUEBA = True   # True = solo muestra lo que haria. False = mueve de verdad.
+
+# -----------------------------------------------
+
+
+def main():
+    carpeta = Path(CARPETA)
+    if not carpeta.is_dir():
+        print(f"No existe la carpeta: {carpeta}")
+        return
+
+    archivos = [f for f in carpeta.iterdir() if f.is_file()]
+    # los codigos mas largos primero, para que "ABC1234" gane sobre "ABC123"
+    codigos = sorted(CODIGOS, key=len, reverse=True)
+
+    movidos = 0
+    sin_codigo = []
+
+    for archivo in archivos:
+        nombre = archivo.name.upper()
+        codigo = next((c for c in codigos if c.upper() in nombre), None)
+
+        if codigo is None:
+            sin_codigo.append(archivo.name)
+            continue
+
+        destino_dir = carpeta / codigo
+        destino = destino_dir / archivo.name
+
+        # si ya existe uno con ese nombre, le agrega un numero
+        n = 1
+        while destino.exists():
+            destino = destino_dir / f"{archivo.stem} ({n}){archivo.suffix}"
+            n += 1
+
+        print(f"{archivo.name}  ->  {codigo}/{destino.name}")
+
+        if not PRUEBA:
+            destino_dir.mkdir(exist_ok=True)
+            shutil.move(str(archivo), str(destino))
+
+        movidos += 1
+
+    print("\n--------------------------------")
+    print(f"Archivos que coinciden: {movidos}")
+    print(f"Sin codigo reconocido:  {len(sin_codigo)}")
+    for n in sin_codigo:
+        print(f"   - {n}")
+    if PRUEBA:
+        print("\nModo PRUEBA: no se movio nada. Cambia PRUEBA = False para ejecutarlo.")
+
+
+if __name__ == "__main__":
+    main()
