@@ -158,6 +158,51 @@ def detect_layout(doc):
     if "desc" in col_x:
         col_x["desc_cont"] = col_x["desc"]
 
+    # ── Columnas 'Rev Description' ───────────────────────────────────────────
+    # Son las dos últimas columnas de la tabla. Según el ancho del reporte:
+    #   SIN WRAP (hoja ancha): caben en la línea principal -> vienen como grupos
+    #     extra después de 'category', y sus valores van en la MISMA línea.
+    #   CON WRAP (hoja angosta): Oracle las envuelve a un segundo renglón de
+    #     guiones -> sus valores van en el RENGLÓN SIGUIENTE de cada fila.
+    rev_desc_wrap = False
+    extra_idx = len(col_names)          # primer grupo sin nombre asignado
+    if len(groups) > extra_idx:
+        # Sin wrap: hay grupos de sobra en la línea principal.
+        # Se asignan por ANCHO, no por orden: 'Rev' es un grupo corto (~3) y
+        # 'Description' uno ancho (~19). Si solo sobra un grupo, es Description
+        # (que es donde se escribe el texto).
+        sobrantes = groups[extra_idx:extra_idx + 2]
+        if len(sobrantes) == 1:
+            cs, ce = sobrantes[0]
+            nombre = "rev_desc_rev" if (ce - cs) <= 5 else "rev_desc"
+            col_x[nombre] = round(x_left + cs * char_w, 2)
+            col_w[nombre] = ce - cs
+        else:
+            for j, nombre in enumerate(["rev_desc_rev", "rev_desc"]):
+                if j < len(sobrantes):
+                    cs, ce = sobrantes[j]
+                    col_x[nombre] = round(x_left + cs * char_w, 2)
+                    col_w[nombre] = ce - cs
+    else:
+        # Con wrap: buscar el renglón de continuación debajo del separador
+        for s in _spans(doc[sep_page]):
+            y = s["bbox"][1]
+            if not (sep_y < y < sep_y + line_h * 2.5):
+                continue
+            t = s["text"]
+            if t.count("-") < 3 or not GROUP_RE.search(t):
+                continue
+            gx0 = s["bbox"][0]
+            cont = [(m.start(), m.end()) for m in GROUP_RE.finditer(t)]
+            for j, nombre in enumerate(["rev_desc_rev", "rev_desc"]):
+                if j < len(cont):
+                    cs, ce = cont[j]
+                    col_x[nombre] = round(gx0 + cs * char_w, 2)
+                    col_w[nombre] = ce - cs
+            rev_desc_wrap = True
+            break
+    col_x.pop("_cont_y", None)
+
     eor_page, eor_y = _find_end_of_report(doc)
 
     return {
@@ -176,6 +221,7 @@ def detect_layout(doc):
         "eor_page": eor_page,
         "eor_y": round(eor_y, 2) if eor_y else None,
         "n_columns": len(groups),
+        "rev_desc_wrap": rev_desc_wrap,
         "col_x": col_x,
         "col_w": col_w,
     }
