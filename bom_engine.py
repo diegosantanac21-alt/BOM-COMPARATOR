@@ -350,6 +350,14 @@ def write_component_fields(page, y_top, comp, layout, color, font_path=None, fon
     if "category" in cx:
         put(cx["category"], comp.get("category", "MISC|MISC"), yb)
 
+    # 'Rev Description': si el encabezado hace WRAP (hoja angosta) va en el
+    # RENGLÓN SIGUIENTE; si no (hoja ancha) va en la MISMA línea, a la derecha.
+    y_rd = (y_top + lh + sz * 0.85) if layout.get("rev_desc_wrap") else yb
+    if comp.get("rev_description") and "rev_desc" in cx:
+        put(cx["rev_desc"], comp["rev_description"], y_rd)
+    if comp.get("rev_description_rev") and "rev_desc_rev" in cx:
+        put(cx["rev_desc_rev"], comp["rev_description_rev"], y_rd)
+
     # descripción (hasta 3 sub-líneas)
     desc_lines = split_description(comp.get("description", ""), cw.get("desc", 14))
     for i, dl in enumerate(desc_lines):
@@ -431,7 +439,8 @@ def find_bom_row(doc, layout, bom_code):
 
 
 def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=None,
-                     rev_bom=None, actualizar_rev_bom=True, redline=True):
+                     rev_bom=None, actualizar_rev_bom=True, redline=True,
+                     rev_description=None):
     """Agrega el BOM al inicio, o actualiza su Rev si ya estaba.
 
     - Si el BOM NO está en la lista -> inserta la fila. Su columna `Rev` toma
@@ -453,10 +462,9 @@ def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=No
         sz = layout["font_size"]
 
         # Valor actual de la columna Rev en esa fila
-        rx0, rx1 = _field_x_range(layout, "rev")
-        margin = layout["char_w"] * 0.5
+        rx0, rx1 = _col_bounds(layout, "rev")
         celdas = [(wx0, wy0, wx1, wy1, t) for wx0, wy0, wx1, wy1, t, *_ in page.get_text("words")
-                  if abs(wy0 - y0) < layout["line_h"] * 0.6 and rx0 - 1 <= wx0 < rx1 - margin]
+                  if abs(wy0 - y0) < layout["line_h"] * 0.6 and rx0 - 1 <= wx0 < rx1]
         if not celdas:
             return False, f"'{bom_code}' ya estaba, pero no se halló su columna Rev.", None
 
@@ -500,10 +508,11 @@ def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=No
     rev_fila = _fmt_rev_num(rev_bom) if rev_bom else "001"
     item = bom_code                     # sin sufijo: la revisión va en la columna Rev
     asm_desc = get_assembly_description(doc, layout)
-    comp = {"level": "1", "op_seq": "10", "item_seq": "10", "item": item,
+    comp = {"level": "1", "op_seq": "1", "item_seq": "1", "item": item,
             "description": f"BOM FOR {asm_desc}".strip(),
-            "rev": rev_fila, "uom": "EA", "quantity": "1.00",
-            "status": "Active", "category": "MISC|MISC"}
+            "rev": rev_fila, "uom": "EA", "quantity": "0.00",
+            "status": "Active", "category": "MISC|MISC",
+            "rev_description": rev_description}
 
     pn, y_first = find_first_component_y(doc, layout)
     if y_first is None:
@@ -589,6 +598,23 @@ def _field_x_range(layout, field):
     return None, None
 
 
+def _col_bounds(layout, key):
+    """Límites [x0, x1) REALES de una columna. Se toma el MENOR entre su ancho en
+    caracteres (col_w) y el inicio de la columna siguiente, para que una columna
+    angosta ('rev', 3 caracteres) nunca invada a su vecina ('uom')."""
+    x0 = layout["col_x"].get(key)
+    if x0 is None:
+        return None, None
+    _, x_sig = _field_x_range(layout, key)
+    ancho = layout["col_w"].get(key)
+    if ancho:
+        x1 = x0 + (ancho + 0.5) * layout["char_w"]
+        if x_sig:
+            x1 = min(x1, x_sig - layout["char_w"] * 0.5)
+        return x0, x1
+    return x0, x_sig
+
+
 def edit_field(doc, layout, item, field, new_value, font_path=None, font_obj=None,
                redline=True):
     """Edita un campo de un componente existente: tacha el valor viejo (rojo) y
@@ -606,10 +632,9 @@ def edit_field(doc, layout, item, field, new_value, font_path=None, font_obj=Non
 
     # Localizar el valor viejo: palabras en la misma fila, dentro de la columna.
     # Se resta un margen al límite derecho para no capturar la columna vecina.
-    fx0, fx1 = _field_x_range(layout, key)
-    margin = layout["char_w"] * 0.5
+    fx0, fx1 = _col_bounds(layout, key)
     row_words = [(x0, y0, x1, y1, t) for x0, y0, x1, y1, t, *_ in page.get_text("words")
-                 if abs(y0 - iy0) < layout["line_h"] * 0.6 and fx0 - 1 <= x0 < fx1 - margin]
+                 if abs(y0 - iy0) < layout["line_h"] * 0.6 and fx0 - 1 <= x0 < fx1]
     if not row_words:
         return False, f"No se encontró el valor actual de '{field}' en '{item}'."
 
@@ -698,3 +723,71 @@ def to_landscape(doc):
         y = (lh - ph) / 2
         new.show_pdf_page(fitz.Rect(x, y, x + pw, y + ph), doc, i)
     return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: ESCRIBIR 'REV DESCRIPTION' EN UN COMPONENTE EXISTENTE
+# ════════════════════════════════════════════════════════════════════════════
+
+def set_rev_description(doc, layout, item, texto, font_path=None, font_obj=None,
+                        redline=True):
+    """Escribe un texto en la columna 'Rev Description' de un componente.
+
+    En este formato el encabezado hace wrap: 'Rev Description' son las últimas
+    columnas de la tabla y sus valores se escriben en el RENGLÓN SIGUIENTE de
+    la fila del componente, en la X del renglón de continuación.
+    """
+    if "rev_desc" not in layout["col_x"]:
+        return False, "Este formato no tiene columna 'Rev Description'."
+
+    occ = find_in_bom_section(doc, layout, item)
+    if not occ:
+        return False, f"Componente '{item}' no encontrado en la sección del BOM."
+
+    pn, x0, y0, x1, y1 = occ[0]
+    page = doc[pn]
+    sz = layout["font_size"]
+    color = RED if redline else BLACK
+
+    # Con wrap (hoja angosta) el valor va en el renglón siguiente; sin wrap
+    # (hoja ancha) va en la misma línea de la fila.
+    x_dest = layout["col_x"]["rev_desc"]
+    y_dest = y0 + layout["line_h"] if layout.get("rev_desc_wrap") else y0
+
+    # ── ¿Ya hay una Rev Description escrita? -> redline sobre ella ───────────
+    rx0, rx1 = _col_bounds(layout, "rev_desc")
+    previas = [(wx0, wy0, wx1, wy1, t) for wx0, wy0, wx1, wy1, t, *_ in page.get_text("words")
+               if abs(wy0 - y_dest) < layout["line_h"] * 0.6 and rx0 - 1 <= wx0 < rx1]
+
+    if previas:
+        vx0 = min(p[0] for p in previas); vy0 = min(p[1] for p in previas)
+        vx1 = max(p[2] for p in previas); vy1 = max(p[3] for p in previas)
+        anterior = " ".join(p[4] for p in sorted(previas, key=lambda p: p[0]))
+
+        # Borrar el valor anterior de su sitio
+        page.add_redact_annot(fitz.Rect(vx0 - 0.5, vy0 + 0.3, vx1 + 0.5, vy1 - 0.3),
+                              fill=WHITE)
+        page.apply_redactions()
+
+        if redline:
+            # Reescribirlo tachado y poner el nuevo debajo
+            _write(page, vx0, vy0 + sz * 0.85, anterior, sz, RED, font_path, font_obj)
+            y_mid = vy0 + (vy1 - vy0) * 0.5
+            page.draw_line(fitz.Point(vx0, y_mid),
+                           fitz.Point(vx0 + _text_width(anterior, sz), y_mid),
+                           color=RED, width=0.7)
+            y_dest = vy0 + layout["line_h"]
+        else:
+            y_dest = vy0        # en limpio, el nuevo ocupa su lugar
+
+    _write(page, x_dest, y_dest + sz * 0.85, str(texto), sz, color, font_path, font_obj)
+    if redline:
+        w = _text_width(str(texto), sz)
+        page.draw_line(fitz.Point(x_dest, y_dest + sz * 1.05),
+                       fitz.Point(x_dest + w, y_dest + sz * 1.05),
+                       color=RED, width=0.6)
+
+    if previas:
+        return True, (f"'{item}': Rev Description '{anterior}' → '{texto}' "
+                      f"(pág. {pn+1}).")
+    return True, f"'{item}': Rev Description = '{texto}' (pág. {pn+1})."
