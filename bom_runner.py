@@ -19,7 +19,8 @@ import fitz
 
 from bom_layout import detect_layout, validate_layout
 from bom_engine import (update_revision, add_bom_at_start, replace_part,
-                        insert_at_end, edit_field, to_landscape, _fmt_rev_num)
+                        insert_at_end, edit_field, to_landscape, _fmt_rev_num,
+                        set_rev_description, bom_already_present)
 from bom_excel import read_instructions
 
 
@@ -97,9 +98,18 @@ def process_one(pdf_path, paquete, output_folder, generar_limpio=True):
 
     # 2) Agregar BOM al inicio (condicional)
     if cfg.get("agregar_bom", True) and cfg.get("codigo_bom"):
+        # Si el BOM YA está en la lista, su Rev Description se aplica ANTES de
+        # tocar su Rev: esa operación escribe debajo y desplazaría la referencia.
+        ya_estaba = bom_already_present(doc_r, layout, cfg["codigo_bom"])
+        if ya_estaba and cfg.get("rev_description"):
+            ok2, m2 = en_ambos(set_rev_description, cfg["codigo_bom"],
+                               cfg["rev_description"])
+            log.append(m2)
+
         ok, m, item_bom = en_ambos(
             add_bom_at_start, cfg["codigo_bom"], new_rev or "A",
-            rev_bom=cfg.get("rev_bom"))
+            rev_bom=cfg.get("rev_bom"),
+            rev_description=cfg.get("rev_description"))
         log.append(m)
 
     # 3) Reemplazos de componente
@@ -109,7 +119,10 @@ def process_one(pdf_path, paquete, output_folder, generar_limpio=True):
 
     # 4) Ediciones de campo
     for item, campo, valor in paquete["ediciones"]:
-        ok, m = en_ambos(edit_field, item, campo, valor)
+        if str(campo).strip().lower() in ("rev_description", "rev_desc", "descripcion_rev"):
+            ok, m = en_ambos(set_rev_description, item, valor)
+        else:
+            ok, m = en_ambos(edit_field, item, campo, valor)
         log.append(m)
 
     # 5) Inserciones al final
