@@ -1,0 +1,19 @@
+import fitz
+from bom_layout import detect_layout
+from bom_engine import find_in_bom_section, _col_bounds
+
+PDF = r"RUTA_DEL_PDF_DE_ENTRADA"   # el original, no el redline
+ITEM = "CE-82-013A-B"
+
+d = fitz.open(PDF); L = detect_layout(d)
+print("cols:", L["n_columns"], "char_w:", L["char_w"])
+for c in ["rev","uom","qty"]:
+    a,b = _col_bounds(L,c)
+    print(f"  {c}: col_x={L['col_x'].get(c)} col_w={L['col_w'].get(c)} bounds=[{a},{b})")
+
+occ = find_in_bom_section(d,L,ITEM)
+pn,x0,y0,x1,y1 = occ[0]
+print(f"\nFila y0={y0:.1f}. Palabras entre x=300 y x=500:")
+for wx0,wy0,wx1,wy1,t,*_ in sorted(d[pn].get_text("words"), key=lambda w:w[0]):
+    if abs(wy0-y0) < L["line_h"]*0.6 and 300 < wx0 < 500:
+        print(f"   x={wx0:7.2f} '{t}'")
