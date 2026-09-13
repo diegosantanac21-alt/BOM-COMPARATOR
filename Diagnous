@@ -1,0 +1,26 @@
+import fitz
+from bom_layout import detect_layout
+from bom_engine import find_in_bom_section, _col_bounds, FIELD_ALIASES
+
+PDF = r"RUTA_DEL_PDF_ORIGINAL"     # el de entrada, no el redline
+
+d = fitz.open(PDF); L = detect_layout(d)
+print("cols:", L["n_columns"], "char_w:", L["char_w"], "wrap:", L.get("rev_desc_wrap"))
+for c in ["rev","uom"]:
+    a,b = _col_bounds(L,c)
+    print(f"  {c}: bounds=[{a:.2f},{b:.2f})")
+
+print("\nAlias de 'rev' ->", FIELD_ALIASES.get("rev"))
+
+# Buscar CUALQUIER item que empiece con CE-82-013A
+sp, ep = L["sep_page"], L["eor_page"]
+for pn in range(sp, ep+1):
+    for x0,y0,x1,y1,t,*_ in d[pn].get_text("words"):
+        if t.startswith("CE-82-013A"):
+            print(f"\nEncontrado '{t}' en pag {pn+1}, y={y0:.1f}")
+            for wx0,wy0,wx1,wy1,wt,*_ in sorted(d[pn].get_text("words"), key=lambda w:w[0]):
+                if abs(wy0-y0) < L["line_h"]*0.6 and 320 < wx0 < 440:
+                    ra,rb = _col_bounds(L,"rev")
+                    marca = "  <-- en rango REV" if ra-1 <= wx0 < rb else ""
+                    print(f"   x={wx0:7.2f} '{wt}'{marca}")
+            break
