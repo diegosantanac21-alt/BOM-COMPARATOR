@@ -26,6 +26,7 @@ _INSERT_MAP = {
     "level": "level", "op_seq": "op_seq", "item_seq": "item_seq",
     "item_status": "status", "status": "status",
     "item_category": "category", "category": "category",
+    "rev_description": "rev_description",
 }
 
 _TRUE = {"si", "sí", "yes", "y", "true", "1", "x", "verdadero"}
@@ -67,7 +68,9 @@ def read_instructions(path):
                        "actualizar_revision": True,
                        "pagina_horizontal": False,
                        "revision_misma_linea": False,
-                       "rev_bom": None},
+                       "rev_bom": None,
+                       "rev_documento": None,
+                       "rev_description": None},
             "reemplazos": [], "inserciones": [], "ediciones": [],
         })
 
@@ -93,6 +96,17 @@ def read_instructions(path):
                     b["revision_misma_linea"] = _as_bool(row[col["revision_misma_linea"]], default=False)
                 if "rev_bom" in col:
                     b["rev_bom"] = _clean(row[col["rev_bom"]])
+                if "rev_description" in col:
+                    b["rev_description"] = _clean(row[col["rev_description"]])
+                # Revisión del DOCUMENTO puesta a mano. Admite varios nombres de
+                # columna porque es fácil confundirla con la del BOM agregado.
+                for alias in ("rev_documento", "revision_nueva", "rev_general",
+                              "revision_documento"):
+                    if alias in col:
+                        valor = _clean(row[col[alias]])
+                        if valor:
+                            b["rev_documento"] = valor
+                        break
 
     # ── Reemplazos ──────────────────────────────────────────────────────────
     if "Reemplazos" in wb.sheetnames:
