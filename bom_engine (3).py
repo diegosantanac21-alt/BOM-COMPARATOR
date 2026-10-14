@@ -1,0 +1,1184 @@
+"""
+bom_engine.py — Operaciones de redline sobre BOMs.
+
+Convención de redline (todo en rojo):
+  - Lo que se ELIMINA  -> tachado (strikethrough)
+  - Lo que se AGREGA    -> escrito en rojo (subrayado)
+
+Cada operación recibe `layout` (de bom_layout.detect_layout) para alinearse al
+formato real del PDF, y se limita a la sección del BOM.
+"""
+
+import os
+import re
+import tempfile
+import fitz
+
+RED   = (0.85, 0.0, 0.0)
+BLACK = (0.0, 0.0, 0.0)
+WHITE = (1.0, 1.0, 1.0)
+
+
+def _spans(page):
+    for b in page.get_text("dict")["blocks"]:
+        if b["type"] != 0:
+            continue
+        for line in b["lines"]:
+            for s in line["spans"]:
+                yield s
+
+
+# ── Fuente para el texto nuevo (redline) ─────────────────────────────────────
+# TextWriter renderiza fuentes externas SIN el bug de codificación de insert_text.
+# Preferencia: Consolas (match exacto, p.ej. en Windows) > DejaVu Sans Mono
+# (muy parecido) > Courier interno. Todas monoespaciadas y de ancho equivalente.
+_MONO_CANDIDATES = [
+    r"C:/Windows/Fonts/consola.ttf",
+    r"C:/Windows/Fonts/Consolas.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/Library/Fonts/Consolas.ttf",
+]
+
+def _resolve_mono_font():
+    for p in _MONO_CANDIDATES:
+        if os.path.exists(p):
+            try:
+                return fitz.Font(fontfile=p)
+            except Exception:
+                continue
+    return fitz.Font("cour")     # Courier interno (siempre disponible)
+
+_FONT = _resolve_mono_font()
+
+
+def _fontsize_ajustado(layout, fontsize):
+    """Ajusta el tamaño para que el ancho de carácter de NUESTRA fuente iguale
+    el del PDF. Consolas mide 0.55em por carácter y Courier/DejaVu ~0.6em, así
+    que escribir al tamaño nominal deja el texto más ancho de la cuenta y lo
+    hace invadir la columna siguiente. `layout['char_w']` es el ancho real
+    medido del documento."""
+    char_w_pdf = (layout or {}).get("char_w")
+    if not char_w_pdf:
+        return fontsize
+    propio = _FONT.text_length("M", fontsize=fontsize)
+    if propio <= 0:
+        return fontsize
+    return round(fontsize * char_w_pdf / propio, 2)
+
+
+def _text_width(text, fontsize, font_obj=None):
+    return _FONT.text_length(str(text), fontsize=fontsize)
+
+
+def _write(page, x, y_baseline, text, fontsize, color, font_path=None, font_obj=None):
+    """Escribe texto nuevo (redline) con TextWriter y la mejor fuente mono disponible."""
+    if not text or not str(text).strip():
+        return
+    tw = fitz.TextWriter(page.rect, color=color)
+    tw.append(fitz.Point(x, y_baseline), str(text), font=_FONT, fontsize=fontsize)
+    tw.write_text(page)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# FUENTE EMBEBIDA (para escribir texto nuevo con el mismo font del PDF)
+# ════════════════════════════════════════════════════════════════════════════
+
+def extract_pdf_font(doc, page_num=0):
+    """Obsoleto (la fuente se resuelve automáticamente). Se mantiene por
+    compatibilidad: devuelve (None, None)."""
+    return None, None
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# BÚSQUEDA EN LA SECCIÓN DEL BOM (ignora otros reportes del PDF)
+# ════════════════════════════════════════════════════════════════════════════
+
+def _norm(s):
+    return s.strip().upper().replace("\u2010", "-").replace("\u2011", "-")
+
+
+def find_in_bom_section(doc, layout, target):
+    """Ocurrencias exactas de `target` dentro de la sección del BOM (entre la
+    línea de guiones y el primer 'End of Report').
+
+    Prioriza las que están en la COLUMNA ITEM: el mismo código puede aparecer
+    también en el encabezado de página ('Item: XXX') o dentro de una
+    descripción, y operar sobre esa fila equivocada haría que las ediciones
+    cayeran en columnas que no corresponden.
+    """
+    tgt = _norm(target)
+    sp, ep = layout["sep_page"], layout["eor_page"]
+    sep_y, eor_y = layout["sep_y"], layout["eor_y"]
+    item_x = layout["col_x"].get("item")
+    tol = layout["char_w"] * 1.5
+
+    en_columna, otras = [], []
+    for pn in range(sp, ep + 1):
+        for x0, y0, x1, y1, t, *_ in doc[pn].get_text("words"):
+            if _norm(t) != tgt:
+                continue
+            if pn == sp and y0 < sep_y:              # antes de la tabla
+                continue
+            if pn == ep and eor_y and y0 > eor_y:    # después de End of Report
+                continue
+            reg = (pn, x0, y0, x1, y1)
+            if item_x is not None and abs(x0 - item_x) <= tol:
+                en_columna.append(reg)
+            else:
+                otras.append(reg)
+
+    # Si hay coincidencias en la columna item, son las únicas válidas.
+    return en_columna if en_columna else otras
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: REEMPLAZAR CÓDIGO DE COMPONENTE (redline)
+# ════════════════════════════════════════════════════════════════════════════
+
+def replace_part(doc, layout, old_part, new_part, font_path=None, font_obj=None,
+                 redline=True):
+    """Por cada ocurrencia de old_part en la sección del BOM:
+        - tacha old_part en rojo (en su lugar)
+        - escribe new_part en rojo, subrayado, justo debajo, en la columna 'item'
+    """
+    occ = find_in_bom_section(doc, layout, old_part)
+    if not occ:
+        return False, f"'{old_part}' no encontrado en la sección del BOM."
+
+    sz = _fontsize_ajustado(layout, layout["font_size"])
+    lh = layout["line_h"]
+    item_x = layout["col_x"]["item"]
+
+    for pn, x0, y0, x1, y1 in occ:
+        page = doc[pn]
+        # Borrar el código viejo de su posición
+        page.add_redact_annot(fitz.Rect(x0 - 1, y0 - 1, x1 + 1, y1 + 1), fill=WHITE)
+        page.apply_redactions()
+
+        if not redline:
+            # MODO LIMPIO: el nuevo código ocupa el lugar del viejo, en negro
+            _write(page, x0, y0 + sz * 0.85, new_part, sz, BLACK, font_path, font_obj)
+            continue
+
+        # MODO REDLINE: viejo tachado en su lugar + nuevo debajo, subrayado
+        _write(page, x0, y0 + sz * 0.85, old_part, sz, RED, font_path, font_obj)
+        y_mid = y0 + (y1 - y0) * 0.48
+        page.draw_line(fitz.Point(x0 - 1, y_mid), fitz.Point(x1 + 1, y_mid),
+                       color=RED, width=0.7)
+        y_below = y0 + lh
+        _write(page, item_x, y_below + sz * 0.85, new_part, sz, RED, font_path, font_obj)
+        w = _text_width(new_part, sz, font_obj)
+        y_ul = y_below + sz * 1.05
+        page.draw_line(fitz.Point(item_x, y_ul), fitz.Point(item_x + w, y_ul),
+                       color=RED, width=0.6)
+
+    pages = ", ".join(str(p + 1) for p, *_ in occ)
+    return True, f"'{old_part}' → '{new_part}' en {len(occ)} lugar(es) (pág. {pages})"
+
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: ELIMINAR UN COMPONENTE
+# ════════════════════════════════════════════════════════════════════════════
+
+def remove_part(doc, layout, item, font_path=None, font_obj=None, redline=True,
+                incluir_continuacion=True):
+    """Elimina un componente del BOM.
+
+    - REDLINE: la fila entera queda TACHADA en rojo (es lo que marca que ese
+      componente sale).
+    - LIMPIO: la fila se borra del documento.
+
+    `incluir_continuacion`: también trata los renglones de continuación de la
+    descripción larga, que pertenecen al mismo componente.
+    """
+    occ = find_in_bom_section(doc, layout, item)
+    if not occ:
+        return False, f"Componente '{item}' no encontrado en la sección del BOM."
+
+    sz = _fontsize_ajustado(layout, layout["font_size"])
+    cols = _ordered_columns(layout)
+    x_desde = cols[0][1] - layout["char_w"]
+    ult, x_ult = cols[-1]
+    x_hasta = x_ult + (layout["col_w"].get(ult, 12) + 2) * layout["char_w"]
+    x_item = layout["col_x"]["item"]
+
+    quitadas = 0
+    for ocurrencia in occ:
+        pn, _ix0, iy0, _ix1, _iy1 = ocurrencia
+        page = doc[pn]
+        tol = _tol_y(layout)
+
+        # ── Renglones que forman este componente ────────────────────────────
+        # Solo cuentan los renglones de CONTINUACIÓN de la descripción: los que
+        # tienen texto ÚNICAMENTE dentro de la columna Description. Cualquier
+        # otra cosa (el siguiente componente, el pie de página, el encabezado
+        # del reporte, el bloque de parámetros) tiene texto fuera de esa franja
+        # y corta la búsqueda. Antes solo se miraba que no hubiera código en la
+        # columna Item, y eso se llevaba por delante el pie del reporte.
+        palabras_pagina = [w for w in page.get_text("words") if w[4].strip()]
+        x_desc = layout["col_x"].get("desc")
+        _, x_desc_fin = _col_bounds(layout, "desc")
+        limite_y = layout["eor_y"] if pn == layout["eor_page"] else None
+
+        ys = [iy0]
+        if incluir_continuacion and x_desc is not None:
+            margen = layout["char_w"] * 0.5
+            tops = sorted({round(w[1], 1) for w in palabras_pagina
+                           if x_desde <= w[0] <= x_hasta})
+            for t in [t for t in tops if t > iy0 + tol * 0.5]:
+                if t - ys[-1] > layout["line_h"] * 1.6:
+                    break                       # hueco vertical: ya es otra cosa
+                if limite_y is not None and t >= limite_y - 1:
+                    break                       # pasado el End of Report
+                en_linea = [w for w in palabras_pagina if abs(w[1] - t) < tol]
+                solo_desc = all(w[0] >= x_desc - margen
+                                and (x_desc_fin is None or w[2] <= x_desc_fin + margen)
+                                for w in en_linea)
+                if not solo_desc:
+                    break                       # no es continuación: se corta
+                ys.append(t)
+                if len(ys) > 8:                 # tope de seguridad
+                    break
+
+        # ── Palabras de esos renglones ──────────────────────────────────────
+        palabras = [(w[0], w[1], w[2], w[3], w[4]) for w in palabras_pagina
+                    if x_desde <= w[0] <= x_hasta
+                    and (limite_y is None or w[1] < limite_y - 1)
+                    and any(abs(w[1] - y) < tol for y in ys)]
+        if not palabras:
+            continue
+
+        for x0, y0, x1, y1, _t in palabras:
+            page.add_redact_annot(fitz.Rect(x0 - 0.5, y0 + 0.3, x1 + 0.5, y1 - 0.3),
+                                  fill=WHITE)
+        page.apply_redactions()
+
+        if redline:
+            # Se reescribe todo en rojo y se tacha renglón por renglón.
+            for x0, y0, x1, y1, t in palabras:
+                _write(page, x0, y0 + sz * 0.85, t, sz, RED, font_path, font_obj)
+            for y in ys:
+                en_linea = [w for w in palabras if abs(w[1] - y) < tol]
+                if not en_linea:
+                    continue
+                lx0 = min(w[0] for w in en_linea)
+                lx1 = max(w[2] for w in en_linea)
+                ly0 = min(w[1] for w in en_linea)
+                ly1 = max(w[3] for w in en_linea)
+                page.draw_line(fitz.Point(lx0 - 1, ly0 + (ly1 - ly0) * 0.48),
+                               fitz.Point(lx1 + 1, ly0 + (ly1 - ly0) * 0.48),
+                               color=RED, width=0.7)
+        quitadas += 1
+
+    if not quitadas:
+        return False, f"'{item}': no se pudo leer su fila para eliminarla."
+    accion = "tachado (eliminado)" if redline else "eliminado"
+    pags = ", ".join(str(p + 1) for p, *_ in occ)
+    return True, f"'{item}' {accion} del BOM (pág. {pags})."
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: ACTUALIZAR REVISIÓN (redline)
+# ════════════════════════════════════════════════════════════════════════════
+
+def next_revision(current_rev):
+    """001/002.. -> 'A';  A..Y -> siguiente letra;  Z -> 'AA';  AB -> 'AC'..."""
+    v = str(current_rev).strip().upper()
+    if not v:
+        return None
+    if v.isdigit():
+        return "A"
+    if v.isalpha():
+        if v[-1] != "Z":
+            return v[:-1] + chr(ord(v[-1]) + 1)
+        return v[:-1] + "AA"   # carry simple (Z->AA, AZ->AAA)
+    return None
+
+
+def _find_revision_values(page):
+    """Encuentra el VALOR de cada 'Revision:' en la página (puede estar en la
+    misma línea o en la siguiente por wrap). Ignora la columna 'Rev' de la tabla."""
+    words = page.get_text("words")
+    by_y = {}
+    for x0, y0, x1, y1, t, *_ in words:
+        by_y.setdefault(round(y0, 0), []).append(
+            {"x0": x0, "y0": y0, "x1": x1, "y1": y1, "text": t})
+    ys = sorted(by_y)
+    out = []
+    for i, yk in enumerate(ys):
+        row = sorted(by_y[yk], key=lambda w: w["x0"])
+        for j, w in enumerate(row):
+            if w["text"].strip().lower() != "revision:":
+                continue
+            # valor en la misma línea (siguiente palabra no vacía)
+            val = None
+            for k in range(j + 1, len(row)):
+                if row[k]["text"].strip() and row[k]["text"].strip() != ":":
+                    val = row[k]; break
+            # si no, en la línea siguiente, cerca del label
+            if val is None and i + 1 < len(ys):
+                nxt = sorted(by_y[ys[i + 1]], key=lambda w: w["x0"])
+                for nw in nxt:
+                    if nw["text"].strip() and nw["x0"] < w["x1"] + 80:
+                        val = nw; break
+            if val is not None:
+                out.append(val)
+    return out
+
+
+def _find_revision_label(page, val):
+    """Devuelve el word 'Revision:' que corresponde a un valor dado (mismo renglón
+    o el renglón anterior, cuando el valor bajó por wrap). None si no se halla."""
+    cands = [w for w in page.get_text("words") if w[4].strip().lower() == "revision:"]
+    if not cands:
+        return None
+    # mismo renglón y a la izquierda
+    same = [w for w in cands if abs(w[1] - val["y0"]) < 3 and w[2] <= val["x0"] + 1]
+    if same:
+        return max(same, key=lambda w: w[2])
+    # renglón anterior (el valor bajó por wrap)
+    prev = [w for w in cands if 0 < (val["y0"] - w[1]) < 30]
+    if prev:
+        return min(prev, key=lambda w: val["y0"] - w[1])
+    return None
+
+
+def update_revision(doc, layout, font_path=None, font_obj=None,
+                    revision_misma_linea=False, redline=True, nueva_rev=None):
+    """Actualiza la revisión del documento en todas las páginas de la sección
+    del BOM. Devuelve (ok, msg, old_rev, new_rev).
+
+    nueva_rev: si se indica, se usa ESA revisión tal cual. Si se deja vacía, se
+    calcula la siguiente a partir de la actual (A -> B -> C ... Z -> AA).
+
+
+    revision_misma_linea: si el valor de la revisión quedó en la línea de abajo
+    (wrap), reescribe el cambio junto a la etiqueta 'Revision:', en su misma línea.
+    """
+    # La revisión aparece en el bloque de parámetros y en el encabezado de cada
+    # página. Ese bloque puede estar en páginas ANTERIORES a la tabla (p. ej. en
+    # los reportes horizontales la tabla arranca en la pág. 2), así que se recorre
+    # desde la primera página hasta el fin de la sección del BOM.
+    ep = layout["eor_page"]
+    sp = 0
+
+    first = None
+    for pn in range(sp, ep + 1):
+        vals = _find_revision_values(doc[pn])
+        if vals:
+            first = vals
+            break
+    if not first:
+        return False, "No se encontró 'Revision:' en el BOM.", None, None
+    old_rev = first[0]["text"].strip()
+    if nueva_rev is not None and str(nueva_rev).strip() != "":
+        new_rev = str(nueva_rev).strip()
+    else:
+        new_rev = next_revision(old_rev)
+        if new_rev is None:
+            return False, (f"No se pudo calcular la revisión siguiente de "
+                           f"'{old_rev}'; indícala en el Excel."), old_rev, None
+    if new_rev.upper() == old_rev.upper():
+        return False, f"La revisión del documento ya es '{old_rev}'.", old_rev, new_rev
+
+    sz = _fontsize_ajustado(layout, layout["font_size"])
+    n = 0
+    for pn in range(sp, ep + 1):
+        page = doc[pn]
+        for v in _find_revision_values(page):
+            if v["text"].strip().upper() != old_rev.upper():
+                continue
+            x0, y0, x1, y1 = v["x0"], v["y0"], v["x1"], v["y1"]
+
+            # ¿El valor está en otra línea que su etiqueta? -> moverlo arriba
+            destino_x, destino_y = x0, y0
+            if revision_misma_linea:
+                lab = _find_revision_label(page, v)
+                if lab is not None and abs(lab[1] - y0) >= 3:
+                    destino_x, destino_y = lab[2] + layout["char_w"], lab[1]
+
+            # borrar el valor viejo de su posición original
+            page.add_redact_annot(fitz.Rect(x0 - 1, y0 - 1, x1 + 1, y1 + 1), fill=WHITE)
+            page.apply_redactions()
+
+            if not redline:
+                # MODO LIMPIO: solo la revisión nueva, en negro y en su sitio
+                _write(page, destino_x, destino_y + sz * 0.85, new_rev, sz,
+                       BLACK, font_path, font_obj)
+                n += 1
+                continue
+
+            # viejo tachado (en el destino) + nuevo al lado
+            _write(page, destino_x, destino_y + sz * 0.85, old_rev, sz, RED, font_path, font_obj)
+            w_old = _text_width(old_rev, sz, font_obj)
+            y_mid = destino_y + (y1 - y0) * 0.5
+            page.draw_line(fitz.Point(destino_x, y_mid), fitz.Point(destino_x + w_old, y_mid),
+                           color=RED, width=0.7)
+            x_new = destino_x + w_old + 4
+            _write(page, x_new, destino_y + sz * 0.85, new_rev, sz, RED, font_path, font_obj)
+            w_new = _text_width(new_rev, sz, font_obj)
+            page.draw_line(fitz.Point(x_new, destino_y + sz * 1.05),
+                           fitz.Point(x_new + w_new, destino_y + sz * 1.05),
+                           color=RED, width=0.5)
+            n += 1
+
+    if n == 0:
+        return (False, f"Revisión '{old_rev}': no se encontró para cambiarla.",
+                old_rev, new_rev)
+    return (True, f"Revisión '{old_rev}' → '{new_rev}' en {n} lugar(es).",
+            old_rev, new_rev)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: AGREGAR EL BOM AL INICIO (condicional)
+# ════════════════════════════════════════════════════════════════════════════
+
+def split_description(desc, width_chars):
+    """Parte la descripción en HASTA 3 sub-líneas sin cortar palabras.
+    Devuelve la lista de líneas no vacías (1 a 3)."""
+    width_chars = max(6, int(width_chars))
+    def cut(s):
+        if len(s) <= width_chars:
+            return s, ""
+        k = s.rfind(" ", 0, width_chars + 1)
+        if k <= 0:
+            k = width_chars
+        return s[:k].rstrip(), s[k:].strip()
+    l1, rest = cut(desc)
+    l2, l3 = cut(rest) if rest else ("", "")
+    return [x for x in (l1, l2, l3) if x] or [""]
+
+
+def get_assembly_description(doc, layout):
+    """Lee la descripción del ensamblaje del header ('Item: <código> <descripción>').
+    Devuelve la descripción (sin el código) o ''."""
+    best = ""
+    for pn in range(layout["sep_page"] + 1):
+        for s in _spans(doc[pn]):
+            t = s["text"]
+            if "Item:" in t and "Organization" not in t:
+                after = t.split("Item:", 1)[1].strip()
+                parts = after.split(None, 1)        # [código, resto...]
+                if len(parts) == 2 and len(parts[1].strip()) > len(best):
+                    best = parts[1].strip()
+    return best
+
+
+def _last_content_y(page):
+    return max((s["bbox"][3] for s in _spans(page)), default=0)
+
+
+def write_component_fields(page, y_top, comp, layout, color, font_path=None, font_obj=None):
+    """Escribe una fila de componente alineada a las columnas detectadas.
+    La descripción puede ocupar hasta 3 sub-líneas."""
+    sz, lh, cx, cw = (_fontsize_ajustado(layout, layout["font_size"]),
+                      layout["line_h"], layout["col_x"], layout["col_w"])
+    cwidth = layout["char_w"]
+
+    def put(x, text, yb):
+        _write(page, x, yb, text, sz, color, font_path, font_obj)
+
+    yb = y_top + sz * 0.85
+    put(cx["level"], comp.get("level", "1"), yb)
+    put(cx["op_seq"], comp.get("op_seq", "10"), yb)
+    put(cx["item_seq"], comp.get("item_seq", "10"), yb)
+    put(cx["item"], comp.get("item", ""), yb)
+    put(cx["rev"], comp.get("rev", "A"), yb)
+    put(cx["uom"], comp.get("uom", "EA"), yb)
+
+    # cantidad: alineada a la derecha del campo qty
+    qty = str(comp.get("quantity", "1.00"))
+    qty_right = cx["qty"] + cw.get("qty", 9) * cwidth
+    put(qty_right - _text_width(qty, sz, font_obj), qty, yb)
+
+    if "status" in cx:
+        put(cx["status"], comp.get("status", "Active"), yb)
+    if "category" in cx:
+        put(cx["category"], comp.get("category", "MISC|MISC"), yb)
+
+    # 'Rev Description': si el encabezado hace WRAP (hoja angosta) va en el
+    # RENGLÓN SIGUIENTE; si no (hoja ancha) va en la MISMA línea, a la derecha.
+    y_rd = (y_top + lh + sz * 0.85) if layout.get("rev_desc_wrap") else yb
+    if comp.get("rev_description") and "rev_desc" in cx:
+        put(cx["rev_desc"], comp["rev_description"], y_rd)
+    if comp.get("rev_description_rev") and "rev_desc_rev" in cx:
+        put(cx["rev_desc_rev"], comp["rev_description_rev"], y_rd)
+
+    # descripción (hasta 3 sub-líneas)
+    desc_lines = split_description(comp.get("description", ""), cw.get("desc", 14))
+    for i, dl in enumerate(desc_lines):
+        put(cx["desc"], dl, y_top + lh * i + sz * 0.85)
+    return len(desc_lines)
+
+
+def _insert_blank_rows(doc, page_num, y_insert, shift):
+    """Parte la página: arriba intacto, abajo desplazado `shift` pts. Devuelve
+    el doc con la página reemplazada (in-place)."""
+    src = doc[page_num]
+    w, h = src.rect.width, src.rect.height
+    tmp = fitz.open(); tmp.insert_pdf(doc, from_page=page_num, to_page=page_num)
+    nd = fitz.open(); npg = nd.new_page(width=w, height=h)
+    top = fitz.Rect(0, 0, w, y_insert - 0.5)
+    npg.show_pdf_page(top, tmp, 0, clip=top)
+    bsrc = fitz.Rect(0, y_insert - 0.5, w, h - shift)
+    bdst = fitz.Rect(0, y_insert - 0.5 + shift, w, h)
+    npg.show_pdf_page(bdst, tmp, 0, clip=bsrc)
+    doc.delete_page(page_num)
+    doc.insert_pdf(nd, from_page=0, to_page=0, start_at=page_num)
+    tmp.close(); nd.close()
+    return doc[page_num]
+
+
+def bom_already_present(doc, layout, bom_code):
+    """¿El código del BOM ya aparece como componente en la sección del BOM?"""
+    base = _norm(bom_code).split("_R")[0]
+    sp, ep = layout["sep_page"], layout["eor_page"]
+    for pn in range(sp, ep + 1):
+        for x0, y0, x1, y1, t, *_ in doc[pn].get_text("words"):
+            if pn == sp and y0 < layout["sep_y"]:
+                continue
+            if pn == ep and layout["eor_y"] and y0 > layout["eor_y"]:
+                continue
+            if _norm(t).startswith(base):
+                return True
+    return False
+
+
+def find_first_component_y(doc, layout):
+    """(page_num, y_top) del primer componente tras la línea de guiones."""
+    sp = layout["sep_page"]
+    page = doc[sp]
+    by_y = {}
+    for s in _spans(page):
+        by_y.setdefault(round(s["bbox"][1], 1), []).append(s)
+    for y in sorted(by_y):
+        if y <= layout["sep_y"] + 1:
+            continue
+        line = " ".join(s["text"] for s in by_y[y]).strip()
+        if line and line[0].isdigit():     # filas empiezan con el nivel (1)
+            return sp, y
+    return None, None
+
+
+def _fmt_rev_num(valor):
+    """Formatea una revisión numérica a 3 dígitos: 9 -> '009', '10' -> '010'."""
+    try:
+        return f"{int(str(valor).strip()):03d}"
+    except (TypeError, ValueError):
+        return str(valor).strip()
+
+
+def find_bom_row(doc, layout, bom_code):
+    """Si el BOM ya está como componente, devuelve (page_num, x0, y0, x1, y1)
+    de su código en la lista. Si no, None."""
+    base = _norm(bom_code).split("_R")[0]
+    sp, ep = layout["sep_page"], layout["eor_page"]
+    for pn in range(sp, ep + 1):
+        for x0, y0, x1, y1, t, *_ in doc[pn].get_text("words"):
+            if pn == sp and y0 < layout["sep_y"]:
+                continue
+            if pn == ep and layout["eor_y"] and y0 > layout["eor_y"]:
+                continue
+            if _norm(t).startswith(base):
+                return (pn, x0, y0, x1, y1)
+    return None
+
+
+def add_bom_at_start(doc, layout, bom_code, new_rev, font_path=None, font_obj=None,
+                     rev_bom=None, actualizar_rev_bom=True, redline=True,
+                     rev_description=None):
+    """Agrega el BOM al inicio, o actualiza su Rev si ya estaba.
+
+    - Si el BOM NO está en la lista -> inserta la fila. Su columna `Rev` toma
+      `rev_bom` (del Excel) o '001' si no se indicó.
+    - Si el BOM YA está -> no se inserta; se actualiza su `Rev`: `rev_bom` si se
+      indicó, o el valor actual + 1 (formato de 3 dígitos). Requiere
+      `actualizar_rev_bom=True`.
+
+    Nota: la revisión general del documento (letras) es independiente de esta.
+    """
+    existente = find_bom_row(doc, layout, bom_code)
+
+    # ── Caso B: el BOM ya estaba -> actualizar su Rev (no insertar) ──────────
+    if existente is not None:
+        if not actualizar_rev_bom:
+            return False, f"'{bom_code}' ya estaba en el BOM; no se agrega.", None
+        pn, x0, y0, x1, y1 = existente
+        page = doc[pn]
+        sz = _fontsize_ajustado(layout, layout["font_size"])
+
+        # Valor actual de la columna Rev en esa fila
+        rx0, rx1 = _col_bounds(layout, "rev")
+        celdas = [(wx0, wy0, wx1, wy1, t) for wx0, wy0, wx1, wy1, t, *_ in page.get_text("words")
+                  if abs(wy0 - y0) < _tol_y(layout) and rx0 - 1 <= wx0 < rx1]
+        if not celdas:
+            return False, f"'{bom_code}' ya estaba, pero no se halló su columna Rev.", None
+
+        vx0 = min(c[0] for c in celdas); vy0 = min(c[1] for c in celdas)
+        vx1 = max(c[2] for c in celdas); vy1 = max(c[3] for c in celdas)
+        rev_actual = " ".join(c[4] for c in sorted(celdas, key=lambda c: c[0]))
+
+        if rev_bom:
+            rev_nueva = _fmt_rev_num(rev_bom)
+        else:
+            try:
+                rev_nueva = _fmt_rev_num(int(rev_actual.strip()) + 1)
+            except ValueError:
+                return (False, f"'{bom_code}': Rev actual '{rev_actual}' no es numérica; "
+                               f"indica la revisión en el Excel.", None)
+
+        page.add_redact_annot(fitz.Rect(vx0 - 1, vy0 - 1, vx1 + 1, vy1 + 1), fill=WHITE)
+        page.apply_redactions()
+
+        if not redline:
+            # MODO LIMPIO: la revisión nueva ocupa el lugar de la vieja, en negro
+            _write(page, vx0, vy0 + sz * 0.85, rev_nueva, sz, BLACK, font_path, font_obj)
+            return (True, f"'{bom_code}' ya estaba: Rev '{rev_actual}' → '{rev_nueva}' "
+                          f"(pág. {pn+1}).", None)
+
+        # redline: tachar el viejo y escribir el nuevo debajo
+        _write(page, vx0, vy0 + sz * 0.85, rev_actual, sz, RED, font_path, font_obj)
+        y_mid = vy0 + (vy1 - vy0) * 0.5
+        page.draw_line(fitz.Point(vx0, y_mid),
+                       fitz.Point(vx0 + _text_width(rev_actual, sz), y_mid),
+                       color=RED, width=0.7)
+        y_bel = vy0 + layout["line_h"]
+        _write(page, rx0, y_bel + sz * 0.85, rev_nueva, sz, RED, font_path, font_obj)
+        w = _text_width(rev_nueva, sz)
+        page.draw_line(fitz.Point(rx0, y_bel + sz * 1.05),
+                       fitz.Point(rx0 + w, y_bel + sz * 1.05), color=RED, width=0.6)
+        return (True, f"'{bom_code}' ya estaba: Rev '{rev_actual}' → '{rev_nueva}' "
+                      f"(pág. {pn+1}).", None)
+
+    # ── Caso A: el BOM no estaba -> insertar la fila ─────────────────────────
+    rev_fila = _fmt_rev_num(rev_bom) if rev_bom else "001"
+    item = bom_code                     # sin sufijo: la revisión va en la columna Rev
+    asm_desc = get_assembly_description(doc, layout)
+    comp = {"level": "1", "op_seq": "1", "item_seq": "1", "item": item,
+            "description": f"BOM FOR {asm_desc}".strip(),
+            "rev": rev_fila, "uom": "EA", "quantity": "0.00",
+            "status": "Active", "category": "MISC|MISC",
+            "rev_description": rev_description}
+
+    pn, y_first = find_first_component_y(doc, layout)
+    if y_first is None:
+        return False, "No se encontró el inicio de la lista de componentes.", None
+
+    n_lines = len(split_description(comp["description"], layout["col_w"].get("desc", 14)))
+    shift = layout["line_h"] * n_lines
+
+    # Red de seguridad Nivel 1: una línea solo se pierde si su TOPE se sale de la
+    # página física tras el desplazamiento. (El proceso usa la hoja completa.)
+    last_top = max((s["bbox"][1] for s in _spans(doc[pn])), default=0)
+    if last_top + shift + layout["line_h"] > layout["page_height"] + 2:
+        return (False,
+                f"Insertar el BOM empujaría contenido fuera de la página {pn+1} "
+                f"(falta reflujo de página). Abortado para no perder datos.", item)
+
+    page = _insert_blank_rows(doc, pn, y_first, shift)
+    color = RED if redline else BLACK
+    write_component_fields(page, y_first, comp, layout, color, font_path, font_obj)
+    return True, f"BOM '{item}' insertado al inicio (pág. {pn+1}).", item
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: INSERTAR COMPONENTE AL FINAL (antes de End of Report)
+# ════════════════════════════════════════════════════════════════════════════
+
+def insert_at_end(doc, layout, comp, font_path=None, font_obj=None, redline=True):
+    """Inserta un componente nuevo como última fila, justo antes de 'End of Report'."""
+    ep, eor_y = layout["eor_page"], layout["eor_y"]
+    if eor_y is None:
+        # Sin 'End of Report' (ni estimado): se usa el final del contenido de la
+        # última página como cierre, para no bloquear la inserción.
+        ep = len(doc) - 1
+        ys = [s["bbox"][3] for s in _spans(doc[ep]) if s["text"].strip()]
+        if not ys:
+            return False, ("insert_at_end: el PDF no tiene texto legible "
+                           "(¿escaneo? haría falta OCR).")
+        eor_y = max(ys) + 2
+
+    # ── Dónde va: justo después del ÚLTIMO COMPONENTE ───────────────────────
+    # No después de la última línea de texto: Oracle repite el encabezado del
+    # reporte (Dominican Republic Inventory, Explosion Level, Page: N...) DESPUÉS
+    # de los componentes y antes del End of Report, y la fila nueva acababa
+    # colocándose debajo de ese bloque, separada de la tabla.
+    page_ins = doc[ep]
+    palabras = [w for w in page_ins.get_text("words") if w[4].strip()]
+    tol = _tol_y(layout)
+    x_item = layout["col_x"]["item"]
+    x_desc = layout["col_x"].get("desc")
+    _, x_desc_fin = _col_bounds(layout, "desc")
+
+    filas = sorted({round(w[1], 1) for w in palabras
+                    if abs(w[0] - x_item) <= layout["char_w"] * 1.5
+                    and w[1] < eor_y - 2
+                    and (ep != layout["sep_page"] or w[1] > layout["sep_y"])
+                    and "-" in w[4] and any(c.isdigit() for c in w[4])})
+
+    if filas:
+        ultima = filas[-1]
+        # Arrastrar los renglones de continuación de su descripción
+        if x_desc is not None:
+            margen = layout["char_w"] * 0.5
+            tops_tod = sorted({round(w[1], 1) for w in palabras if w[1] < eor_y - 2})
+            for t in [t for t in tops_tod if t > ultima + tol * 0.5]:
+                if t - ultima > layout["line_h"] * 1.6:
+                    break
+                en_linea = [w for w in palabras if abs(w[1] - t) < tol]
+                if not all(w[0] >= x_desc - margen
+                           and (x_desc_fin is None or w[2] <= x_desc_fin + margen)
+                           for w in en_linea):
+                    break
+                ultima = t
+        y_insert = ultima + layout["line_h"]
+    else:
+        tops = [s["bbox"][1] for s in _spans(page_ins) if s["bbox"][1] < eor_y - 2]
+        y_insert = (max(tops) if tops else layout["sep_y"]) + layout["line_h"]
+
+    n_lines = len(split_description(comp.get("description", ""),
+                                    layout["col_w"].get("desc", 14)))
+    shift = layout["line_h"] * n_lines
+
+    page_top_last = max((s["bbox"][1] for s in _spans(doc[ep])), default=0)
+    if page_top_last + shift + layout["line_h"] > layout["page_height"] + 2:
+        return (False, f"Insertar al final desbordaría la página {ep+1} "
+                       f"(falta reflujo de página). Abortado.")
+
+    page = _insert_blank_rows(doc, ep, y_insert, shift)
+    color = RED if redline else BLACK
+    write_component_fields(page, y_insert, comp, layout, color, font_path, font_obj)
+    return True, f"Componente '{comp.get('item','')}' insertado al final (pág. {ep+1})."
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: EDITAR UN CAMPO DE UN COMPONENTE EXISTENTE (redline)
+# ════════════════════════════════════════════════════════════════════════════
+
+# Nombres de campo aceptados (Excel) -> clave de columna del layout
+FIELD_ALIASES = {
+    "cantidad": "qty", "quantity": "qty", "qty": "qty",
+    "rev": "rev", "revision": "rev",
+    "uom": "uom", "um": "uom",
+    "descripcion": "desc", "descripción": "desc", "description": "desc",
+    "status": "status", "item_status": "status", "estado": "status",
+    "category": "category", "item_category": "category", "categoria": "category",
+    "level": "level", "nivel": "level",
+    "op_seq": "op_seq", "item_seq": "item_seq",
+    # Formas sueltas, por si se escriben distinto en el Excel
+    "seq": "item_seq", "secuencia": "item_seq", "itemseq": "item_seq",
+    "secuencia_item": "item_seq", "item_sequence": "item_seq",
+    "opseq": "op_seq", "secuencia_op": "op_seq", "operation_seq": "op_seq",
+    "operacion": "op_seq", "nivel_bom": "level",
+    "item": "item", "parte": "item", "part_number": "item",
+}
+
+
+def _clave_campo(field):
+    """Normaliza el nombre del campo escrito en el Excel y devuelve la clave
+    interna. Tolera mayúsculas, espacios, guiones, puntos y tildes:
+    'Item Seq', 'ITEM-SEQ', 'item seq.' -> 'item_seq'."""
+    if field is None:
+        return None
+    txt = str(field).strip().lower()
+    for a, b in (("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")):
+        txt = txt.replace(a, b)
+    txt = re.sub(r"[\s\-.]+", "_", txt).strip("_")
+    return FIELD_ALIASES.get(txt)
+
+
+# Columnas auxiliares: no pertenecen a la fila de datos, sino a los renglones de
+# continuación (descripción larga, Rev Description). Comparten X con level/op_seq,
+# así que si entran en el orden de columnas estropean los límites de esas dos.
+COLS_AUX = ("desc_cont", "rev_desc", "rev_desc_rev")
+
+
+def _ordered_columns(layout, incluir_aux=False):
+    """Lista de (nombre, x) ordenada por X. Por defecto, solo las columnas
+    reales de la tabla (sin las auxiliares de los renglones de continuación)."""
+    cols = [(c, x) for c, x in layout["col_x"].items()
+            if incluir_aux or c not in COLS_AUX]
+    return sorted(cols, key=lambda t: t[1])
+
+
+def _field_x_range(layout, field):
+    """Rango [x0, x1) horizontal de la columna `field` en la fila."""
+    ordered = _ordered_columns(layout, incluir_aux=field in COLS_AUX)
+    for i, (name, x) in enumerate(ordered):
+        if name == field:
+            x1 = ordered[i + 1][1] if i + 1 < len(ordered) else layout["page_width"]
+            return x, x1
+    return None, None
+
+
+# Unidades de medida habituales: si un valor "de revisión" es en realidad uno de
+# estos, la columna se identificó mal y no debe editarse.
+UOM_CONOCIDOS = {"EA", "ML", "GR", "BX", "KG", "LB", "FT", "IN", "CM", "MM",
+                 "L", "M", "OZ", "PK", "RL", "SH", "YD", "CS", "DZ", "GAL"}
+
+
+def _parece_revision(valor):
+    """¿El texto tiene forma de revisión? Letras solas (A, B, AA) o dígitos
+    (001, 09). Sirve como segunda comprobación cuando la geometría no basta:
+    un 'EA' o '10.000000' nunca es una revisión."""
+    v = str(valor).strip().upper()
+    if not v or len(v) > 4:
+        return False
+    if v in UOM_CONOCIDOS:
+        return False
+    return v.isdigit() or v.isalpha()
+
+
+def _tol_y(layout):
+    """Tolerancia vertical para considerar que dos palabras están en la MISMA
+    fila. Se acota por el tamaño de fuente: si line_h se detectó mal (p. ej. el
+    doble de lo real), una tolerancia proporcional abarcaría la fila siguiente y
+    mezclaría sus valores (bug: editar UOM 'EA' creyendo que era Rev)."""
+    return min(layout["line_h"] * 0.6, layout["font_size"] * 0.55)
+
+
+def _col_bounds(layout, key):
+    """Límites [x0, x1) REALES de una columna. Se toma el MENOR entre su ancho en
+    caracteres (col_w) y el inicio de la columna siguiente, para que una columna
+    angosta ('rev', 3 caracteres) nunca invada a su vecina ('uom')."""
+    x0 = layout["col_x"].get(key)
+    if x0 is None:
+        return None, None
+    _, x_sig = _field_x_range(layout, key)
+    ancho = layout["col_w"].get(key)
+    if ancho:
+        x1 = x0 + (ancho + 0.5) * layout["char_w"]
+        if x_sig:
+            x1 = min(x1, x_sig - layout["char_w"] * 0.5)
+        return x0, x1
+    return x0, x_sig
+
+
+def _x_vecinas(layout, key):
+    """Devuelve (fin_de_la_columna_anterior, inicio_de_la_siguiente) para `key`.
+    Sirve para saber cuánto hueco libre hay a cada lado de un valor."""
+    ordered = _ordered_columns(layout)
+    nombres = [n for n, _ in ordered]
+    if key not in nombres:
+        return None, None
+    i = nombres.index(key)
+    x_prev_fin = None
+    if i > 0:
+        prev = nombres[i - 1]
+        x_prev_fin = (layout["col_x"][prev]
+                      + layout["col_w"].get(prev, 1) * layout["char_w"])
+    x_sig = ordered[i + 1][1] if i + 1 < len(ordered) else None
+    return x_prev_fin, x_sig
+
+
+def _vecinos_reales(page, layout, iy0, vx0, vx1):
+    """Hueco real en la fila: fin de la palabra anterior e inicio de la siguiente.
+    Es más fiable que las columnas cuando los valores van alineados a la derecha."""
+    izq, der = None, None
+    for x0, y0, x1, _y1, t, *_ in page.get_text("words"):
+        if abs(y0 - iy0) >= _tol_y(layout) or not t.strip():
+            continue
+        if x1 <= vx0 + 0.5:
+            izq = x1 if izq is None else max(izq, x1)
+        elif x0 >= vx1 - 0.5:
+            der = x0 if der is None else min(der, x0)
+    return izq, der
+
+
+def _hueco_para_nuevo(layout, key, vx0, vx1, ancho_nuevo, vecinos=None):
+    """Elige dónde escribir el valor nuevo junto al tachado.
+
+    1) a la derecha, si cabe antes de la columna siguiente;
+    2) a la izquierda, si cabe después de la columna anterior
+       (caso de item_seq / op_seq / level, que van alineados a la derecha);
+    3) None  → no hay hueco lateral, se escribirá debajo.
+    """
+    margen = layout["char_w"] * 0.4
+    x_prev_fin, x_sig = _x_vecinas(layout, key)
+    if vecinos:
+        v_izq, v_der = vecinos
+        if v_izq is not None:
+            x_prev_fin = v_izq if x_prev_fin is None else max(x_prev_fin, v_izq)
+        if v_der is not None:
+            x_sig = v_der if x_sig is None else min(x_sig, v_der)
+    if x_sig is not None and vx1 + margen + ancho_nuevo <= x_sig - margen:
+        return vx1 + margen
+    if x_prev_fin is not None and vx0 - margen - ancho_nuevo >= x_prev_fin + margen:
+        return vx0 - margen - ancho_nuevo
+    return None
+
+
+COLS_NUM = ("level", "op_seq", "item_seq")
+NUM_RE = re.compile(r"^\d+$")
+
+
+def _valor_columna_numerica(page, layout, iy0, key):
+    """Localiza el valor de Level / Op Seq / Item Seq POR ORDEN, no por X.
+
+    Esas tres columnas son estrechas y sus números pueden ir alineados a la
+    izquierda o a la derecha según el reporte, así que el valor de una puede
+    caer dentro del rango X de la vecina: por geometría se edita la columna de
+    al lado. En cambio el ORDEN nunca cambia: en toda fila de la tabla van
+    Level, Op Seq, Item Seq y después el código del Item.
+
+    Devuelve (x0, y0, x1, y1, texto) o None si no se puede determinar sin duda.
+    """
+    presentes = [c for c in COLS_NUM if c in layout["col_x"]]
+    presentes.sort(key=lambda c: layout["col_x"][c])
+    if key not in presentes:
+        return None
+
+    x_item = layout["col_x"].get("item")
+    if x_item is None:
+        return None
+    limite = x_item - layout["char_w"] * 0.5
+
+    nums = [(x0, y0, x1, y1, t) for x0, y0, x1, y1, t, *_ in page.get_text("words")
+            if abs(y0 - iy0) < _tol_y(layout) and x1 <= limite and NUM_RE.match(t)]
+    nums.sort(key=lambda w: w[0])
+
+    # Solo es fiable si hay exactamente un número por columna estrecha.
+    if len(nums) != len(presentes):
+        return None
+    return nums[presentes.index(key)]
+
+
+def edit_field(doc, layout, item, field, new_value, font_path=None, font_obj=None,
+               redline=True):
+    """Edita un campo de un componente existente: tacha el valor viejo (rojo) y
+    escribe el nuevo (rojo) en la misma columna. `field` admite alias en español."""
+    key = _clave_campo(field)
+    if key is None:
+        return False, (f"Campo '{field}' no reconocido. Usa: level, op_seq, "
+                       f"item_seq, item, descripcion, rev, uom, cantidad, "
+                       f"status, category.")
+    if key not in layout["col_x"]:
+        return False, f"Campo '{field}' ({key}) no existe en este formato de reporte."
+
+    occ = find_in_bom_section(doc, layout, item)
+    if not occ:
+        return False, f"Componente '{item}' no encontrado en la sección del BOM."
+    pn, ix0, iy0, ix1, iy1 = occ[0]
+    page = doc[pn]
+    sz = _fontsize_ajustado(layout, layout["font_size"])
+
+    # Localizar el valor viejo: palabras en la misma fila, dentro de la columna.
+    # Se resta un margen al límite derecho para no capturar la columna vecina.
+    fx0, fx1 = _col_bounds(layout, key)
+    row_words = None
+
+    # Level / Op Seq / Item Seq: se localizan POR ORDEN (ver
+    # _valor_columna_numerica). Es lo único fiable cuando los números van
+    # alineados a la derecha y se salen del rango X de su propia columna.
+    if key in COLS_NUM:
+        por_orden = _valor_columna_numerica(page, layout, iy0, key)
+        if por_orden is not None:
+            row_words = [por_orden]
+
+    if row_words is None:
+        row_words = [(x0, y0, x1, y1, t) for x0, y0, x1, y1, t, *_ in page.get_text("words")
+                     if abs(y0 - iy0) < _tol_y(layout) and fx0 - 1 <= x0 < fx1]
+    if not row_words:
+        return False, f"No se encontró el valor actual de '{field}' en '{item}'."
+
+    vx0 = min(w[0] for w in row_words)
+    vy0 = min(w[1] for w in row_words)
+    vx1 = max(w[2] for w in row_words)
+    vy1 = max(w[3] for w in row_words)
+    old_value = " ".join(w[4] for w in sorted(row_words, key=lambda w: w[0]))
+
+    # Level / Op Seq / Item Seq siempre son números. Si por geometría salió
+    # otra cosa, las columnas de ese PDF están corridas: se avisa en vez de
+    # editar la columna vecina.
+    if key in COLS_NUM and not NUM_RE.match(old_value.strip()):
+        return False, (f"'{item}': en la columna {field} se leyó '{old_value}', "
+                       f"que no es un número; no se editó (columnas corridas).")
+
+    # Segunda comprobación para 'rev': el valor debe TENER FORMA de revisión.
+    # Si salió un UOM o un número largo, la columna se identificó mal y se
+    # aborta en vez de editar el campo equivocado.
+    if key == "rev" and not _parece_revision(old_value):
+        # Plan B: buscar en la fila un valor con forma de revisión, situado
+        # ANTES de la columna UOM. Cubre los PDFs donde la columna Rev quedó
+        # ligeramente corrida respecto a la línea de guiones.
+        ux0, _ = _col_bounds(layout, "uom")
+        candidatos = [(wx0, wy0, wx1, wy1, t)
+                      for wx0, wy0, wx1, wy1, t, *_ in page.get_text("words")
+                      if abs(wy0 - iy0) < _tol_y(layout)
+                      and layout["col_x"]["desc"] < wx0 < (ux0 or fx1)
+                      and _parece_revision(t)]
+        if not candidatos:
+            return False, (f"'{item}': el valor hallado en Rev es '{old_value}', que "
+                           f"no parece una revisión; no se editó (posible desalineación).")
+        # El más cercano al inicio de la columna Rev
+        mejor = min(candidatos, key=lambda c: abs(c[0] - fx0))
+        vx0, vy0, vx1, vy1 = mejor[0], mejor[1], mejor[2], mejor[3]
+        old_value = mejor[4]
+
+    # Si no se indicó un valor nuevo, se calcula automáticamente a partir del actual.
+    # Para `rev` la secuencia es alfabética (A->B->C ... Z->AA); si el valor actual
+    # es numérico, next_revision devuelve 'A'.
+    if new_value is None or str(new_value).strip() == "":
+        if key != "rev":
+            return False, (f"'{item}': falta el valor nuevo para '{field}' "
+                           f"(solo 'rev' se calcula solo).")
+        calculado = next_revision(old_value)
+        if calculado is None:
+            return False, (f"'{item}': no se pudo calcular la revisión siguiente "
+                           f"de '{old_value}'; indícala en el Excel.")
+        new_value = calculado
+
+    # 1. tachar viejo (rojo, en su lugar). El rectángulo se ajusta a la caja del
+    #    valor sin margen vertical: las filas están separadas por line_h y un
+    #    margen mayor borraría texto de la fila vecina.
+    page.add_redact_annot(fitz.Rect(vx0 - 0.5, vy0 + 0.3, vx1 + 0.5, vy1 - 0.3), fill=WHITE)
+    page.apply_redactions()
+
+    if not redline:
+        # MODO LIMPIO: el valor nuevo ocupa el lugar del viejo, en negro
+        new_value = str(new_value)
+        if key == "qty":
+            right = layout["col_x"]["qty"] + layout["col_w"].get("qty", 9) * layout["char_w"]
+            nx = right - _text_width(new_value, sz)
+        else:
+            nx = vx0
+        _write(page, nx, vy0 + sz * 0.85, new_value, sz, BLACK, font_path, font_obj)
+        return True, f"'{item}': {field} '{old_value}' → '{new_value}' (pág. {pn+1})."
+
+    _write(page, vx0, vy0 + sz * 0.85, old_value, sz, RED, font_path, font_obj)
+    y_mid = vy0 + (vy1 - vy0) * 0.5
+    page.draw_line(fitz.Point(vx0, y_mid), fitz.Point(vx0 + _text_width(old_value, sz), y_mid),
+                   color=RED, width=0.7)
+
+    # 2. escribir el nuevo. Para `rev` (valor corto) va AL LADO del tachado, así no
+    #    invade la fila de abajo; el resto va debajo. qty se alinea a la derecha.
+    new_value = str(new_value)
+    if key == "rev":
+        nx = vx0 + _text_width(old_value, sz) + 3
+        ny = vy0
+    else:
+        lateral = _hueco_para_nuevo(layout, key, vx0, vx1, _text_width(new_value, sz),
+                                    vecinos=_vecinos_reales(page, layout, iy0, vx0, vx1))
+        if lateral is not None:
+            nx, ny = lateral, vy0
+        else:
+            ny = vy0 + layout["line_h"]
+            if key == "qty":
+                right = (layout["col_x"]["qty"]
+                         + layout["col_w"].get("qty", 9) * layout["char_w"])
+                nx = right - _text_width(new_value, sz)
+            else:
+                nx = fx0
+    _write(page, nx, ny + sz * 0.85, new_value, sz, RED, font_path, font_obj)
+    w = _text_width(new_value, sz)
+    page.draw_line(fitz.Point(nx, ny + sz * 1.05), fitz.Point(nx + w, ny + sz * 1.05),
+                   color=RED, width=0.6)
+
+    return True, f"'{item}': {field} '{old_value}' → '{new_value}' (pág. {pn+1})."
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# POST-PROCESO: CONVERTIR A PÁGINA HORIZONTAL (APAISADA)
+# ════════════════════════════════════════════════════════════════════════════
+
+def to_landscape(doc):
+    """Devuelve un documento NUEVO con cada página en formato apaisado
+    (ancho x alto invertidos), con el contenido centrado y escalado para que
+    entre completo y el texto siga legible en horizontal.
+
+    Se aplica al FINAL, después de todas las operaciones de redline.
+    """
+    out = fitz.open()
+    for i in range(len(doc)):
+        p = doc[i]
+        w, h = p.rect.width, p.rect.height
+        lw, lh = h, w                                  # invertir: 612x792 -> 792x612
+        new = out.new_page(width=lw, height=lh)
+        scale = min(lw / w, lh / h)
+        pw, ph = w * scale, h * scale
+        x = (lw - pw) / 2
+        y = (lh - ph) / 2
+        new.show_pdf_page(fitz.Rect(x, y, x + pw, y + ph), doc, i)
+    return out
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# OPERACIÓN: ESCRIBIR 'REV DESCRIPTION' EN UN COMPONENTE EXISTENTE
+# ════════════════════════════════════════════════════════════════════════════
+
+def set_rev_description(doc, layout, item, texto, font_path=None, font_obj=None,
+                        redline=True):
+    """Escribe un texto en la columna 'Rev Description' de un componente.
+
+    En este formato el encabezado hace wrap: 'Rev Description' son las últimas
+    columnas de la tabla y sus valores se escriben en el RENGLÓN SIGUIENTE de
+    la fila del componente, en la X del renglón de continuación.
+    """
+    if "rev_desc" not in layout["col_x"]:
+        return False, "Este formato no tiene columna 'Rev Description'."
+
+    occ = find_in_bom_section(doc, layout, item)
+    if not occ:
+        return False, f"Componente '{item}' no encontrado en la sección del BOM."
+
+    pn, x0, y0, x1, y1 = occ[0]
+    page = doc[pn]
+    sz = _fontsize_ajustado(layout, layout["font_size"])
+    color = RED if redline else BLACK
+
+    # Con wrap (hoja angosta) el valor va en el renglón siguiente; sin wrap
+    # (hoja ancha) va en la misma línea de la fila.
+    x_dest = layout["col_x"]["rev_desc"]
+    y_dest = y0 + layout["line_h"] if layout.get("rev_desc_wrap") else y0
+
+    # Con wrap, el renglón de destino debe ser una línea de continuación. Si en
+    # esa Y ya hay otro componente (porque este no tiene descripción larga), el
+    # texto pisaría —y el tachado borraría— datos de la fila siguiente: se avisa
+    # en vez de dañar el documento.
+    if layout.get("rev_desc_wrap"):
+        ix0, ix1 = _col_bounds(layout, "item")
+        choca = [t for wx0, wy0, wx1, wy1, t, *_ in page.get_text("words")
+                 if abs(wy0 - y_dest) < _tol_y(layout) and ix0 - 1 <= wx0 < (ix1 or ix0 + 1)]
+        if choca:
+            return False, (f"'{item}': no hay renglón libre debajo para la Rev "
+                           f"Description (la línea siguiente es el componente "
+                           f"'{choca[0]}'); no se escribió nada.")
+
+    # ── ¿Ya hay una Rev Description escrita? -> redline sobre ella ───────────
+    rx0, rx1 = _col_bounds(layout, "rev_desc")
+    previas = [(wx0, wy0, wx1, wy1, t) for wx0, wy0, wx1, wy1, t, *_ in page.get_text("words")
+               if abs(wy0 - y_dest) < _tol_y(layout) and rx0 - 1 <= wx0 < rx1]
+
+    if previas:
+        vx0 = min(p[0] for p in previas); vy0 = min(p[1] for p in previas)
+        vx1 = max(p[2] for p in previas); vy1 = max(p[3] for p in previas)
+        anterior = " ".join(p[4] for p in sorted(previas, key=lambda p: p[0]))
+
+        # Borrar el valor anterior de su sitio
+        page.add_redact_annot(fitz.Rect(vx0 - 0.5, vy0 + 0.3, vx1 + 0.5, vy1 - 0.3),
+                              fill=WHITE)
+        page.apply_redactions()
+
+        if redline:
+            # Reescribirlo tachado y poner el nuevo debajo
+            _write(page, vx0, vy0 + sz * 0.85, anterior, sz, RED, font_path, font_obj)
+            y_mid = vy0 + (vy1 - vy0) * 0.5
+            page.draw_line(fitz.Point(vx0, y_mid),
+                           fitz.Point(vx0 + _text_width(anterior, sz), y_mid),
+                           color=RED, width=0.7)
+            y_dest = vy0 + layout["line_h"]
+        else:
+            y_dest = vy0        # en limpio, el nuevo ocupa su lugar
+
+    _write(page, x_dest, y_dest + sz * 0.85, str(texto), sz, color, font_path, font_obj)
+    if redline:
+        w = _text_width(str(texto), sz)
+        page.draw_line(fitz.Point(x_dest, y_dest + sz * 1.05),
+                       fitz.Point(x_dest + w, y_dest + sz * 1.05),
+                       color=RED, width=0.6)
+
+    if previas:
+        return True, (f"'{item}': Rev Description '{anterior}' → '{texto}' "
+                      f"(pág. {pn+1}).")
+    return True, f"'{item}': Rev Description = '{texto}' (pág. {pn+1})."
